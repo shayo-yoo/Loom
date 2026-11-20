@@ -1,0 +1,10 @@
+{
+    "display_name": "Loom",
+    "loading_order": 950,
+    "requires": [],
+    "optional": [],
+    "js": "Loom UI/index.js",
+    "css": "Loom UI/style.css",
+    "author": "Loom Project",
+    "version": "0.7.0"
+}
