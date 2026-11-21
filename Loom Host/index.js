@@ -1,7 +1,7 @@
 import '../Loom%20Core/index.js';
 
 const EXTENSION_ID = 'loom-host';
-const HOST_VERSION = '0.29.0';
+const HOST_VERSION = '0.30.0';
 const runtime = globalThis.Loom;
 
 const nullInput = { type: 'null' };
@@ -701,35 +701,49 @@ const chatMessagesCapability = {
 const worldsEntriesCapability = {
     id: 'worlds.entries',
     name: '世界书条目',
-    description: '读取指定世界书的条目内容（只读）。',
+    description: '分页读取指定世界书的条目（只读），可按子串搜索备注/关键词/内容。',
     input: {
         type: 'object',
         required: ['name'],
         properties: {
             name: { type: 'string', minLength: 1 },
             limit: { type: 'integer', minimum: 1, maximum: 200 },
+            offset: { type: 'integer', minimum: 0 },
+            query: { type: 'string', maxLength: 200 },
         },
         additionalProperties: false,
     },
     output: {
-        type: 'array',
-        items: {
-            type: 'object',
-            required: ['uid', 'comment', 'keys', 'secondaryKeys', 'content', 'enabled', 'constant', 'selective', 'order', 'truncated'],
-            properties: {
-                uid: { type: 'string' },
-                comment: { type: 'string' },
-                keys: { type: 'array', items: { type: 'string' } },
-                secondaryKeys: { type: 'array', items: { type: 'string' } },
-                content: { type: 'string' },
-                enabled: { type: 'boolean' },
-                constant: { type: 'boolean' },
-                selective: { type: 'boolean' },
-                order: { type: 'integer' },
-                truncated: { type: 'boolean' },
+        type: 'object',
+        required: ['name', 'total', 'offset', 'limit', 'hasMore', 'entries'],
+        properties: {
+            name: { type: 'string' },
+            total: { type: 'integer', minimum: 0 },
+            offset: { type: 'integer', minimum: 0 },
+            limit: { type: 'integer', minimum: 0 },
+            hasMore: { type: 'boolean' },
+            entries: {
+                type: 'array',
+                items: {
+                    type: 'object',
+                    required: ['uid', 'comment', 'keys', 'secondaryKeys', 'content', 'enabled', 'constant', 'selective', 'order', 'truncated'],
+                    properties: {
+                        uid: { type: 'string' },
+                        comment: { type: 'string' },
+                        keys: { type: 'array', items: { type: 'string' } },
+                        secondaryKeys: { type: 'array', items: { type: 'string' } },
+                        content: { type: 'string' },
+                        enabled: { type: 'boolean' },
+                        constant: { type: 'boolean' },
+                        selective: { type: 'boolean' },
+                        order: { type: 'integer' },
+                        truncated: { type: 'boolean' },
+                    },
+                    additionalProperties: false,
+                },
             },
-            additionalProperties: false,
         },
+        additionalProperties: false,
     },
     execute: async (input) => {
         const context = getHostContext();
@@ -738,27 +752,43 @@ const worldsEntriesCapability = {
         }
         const data = await context.loadWorldInfo(input.name);
         const entries = data?.entries;
-        if (!entries || typeof entries !== 'object') return [];
-
         const limit = Math.min(Math.max(input.limit ?? 200, 1), 200);
-        return Object.entries(entries)
-            .map(([key, entry]) => {
-                const { text, truncated } = truncate(entry?.content, ENTRY_TEXT_LIMIT);
-                return {
-                    uid: String(entry?.uid ?? key),
-                    comment: String(entry?.comment ?? ''),
-                    keys: Array.isArray(entry?.key) ? entry.key.map(String) : [],
-                    secondaryKeys: Array.isArray(entry?.keysecondary) ? entry.keysecondary.map(String) : [],
-                    content: text,
-                    enabled: !entry?.disable,
-                    constant: Boolean(entry?.constant),
-                    selective: Boolean(entry?.selective),
-                    order: Number.isFinite(entry?.order) ? Math.trunc(entry.order) : 0,
-                    truncated,
-                };
-            })
-            .sort((left, right) => left.order - right.order || left.uid.localeCompare(right.uid))
-            .slice(0, limit);
+        const offset = Math.max(input.offset ?? 0, 0);
+        const empty = { name: input.name, total: 0, offset, limit, hasMore: false, entries: [] };
+        if (!entries || typeof entries !== 'object') return empty;
+
+        const mapped = Object.entries(entries).map(([key, entry]) => {
+            const { text, truncated } = truncate(entry?.content, ENTRY_TEXT_LIMIT);
+            return {
+                uid: String(entry?.uid ?? key),
+                comment: String(entry?.comment ?? ''),
+                keys: Array.isArray(entry?.key) ? entry.key.map(String) : [],
+                secondaryKeys: Array.isArray(entry?.keysecondary) ? entry.keysecondary.map(String) : [],
+                content: text,
+                enabled: !entry?.disable,
+                constant: Boolean(entry?.constant),
+                selective: Boolean(entry?.selective),
+                order: Number.isFinite(entry?.order) ? Math.trunc(entry.order) : 0,
+                truncated,
+            };
+        }).sort((left, right) => left.order - right.order || left.uid.localeCompare(right.uid));
+
+        // Search runs over the mapped fields (comment, keys, visible content), so a
+        // query behaves the same as what the caller can see.
+        const query = typeof input.query === 'string' ? input.query.trim().toLowerCase() : '';
+        const matched = query === ''
+            ? mapped
+            : mapped.filter(entry => [entry.comment, ...entry.keys, ...entry.secondaryKeys, entry.content]
+                .some(value => value.toLowerCase().includes(query)));
+        const page = matched.slice(offset, offset + limit);
+        return {
+            name: input.name,
+            total: matched.length,
+            offset,
+            limit,
+            hasMore: offset + page.length < matched.length,
+            entries: page,
+        };
     },
 };
 

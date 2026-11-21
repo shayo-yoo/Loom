@@ -1554,27 +1554,75 @@ test('reads world book entries through the host loader', async () => {
     const result = await executeCapability(EXTENSION_ID, 'worlds.entries', { name: 'Lore' });
     assert.equal(result.success, true);
     assert.deepEqual(loaded, ['Lore']);
-    assert.deepEqual(result.data, [
-        {
-            uid: '1', comment: 'first', keys: ['a'], secondaryKeys: ['a2'], content: 'A content',
-            enabled: true, constant: true, selective: true, order: 100, truncated: false,
-        },
-        {
-            uid: '2', comment: 'second', keys: ['b'], secondaryKeys: [], content: 'B content',
-            enabled: false, constant: false, selective: false, order: 200, truncated: false,
-        },
-    ]);
+    assert.deepEqual(result.data, {
+        name: 'Lore',
+        total: 2,
+        offset: 0,
+        limit: 200,
+        hasMore: false,
+        entries: [
+            {
+                uid: '1', comment: 'first', keys: ['a'], secondaryKeys: ['a2'], content: 'A content',
+                enabled: true, constant: true, selective: true, order: 100, truncated: false,
+            },
+            {
+                uid: '2', comment: 'second', keys: ['b'], secondaryKeys: [], content: 'B content',
+                enabled: false, constant: false, selective: false, order: 200, truncated: false,
+            },
+        ],
+    });
+});
+
+test('worlds.entries pages and searches without losing the total', async () => {
+    const entries = {};
+    for (let uid = 0; uid < 12; uid += 1) {
+        entries[uid] = {
+            uid, comment: `entry ${uid}`, key: uid % 2 === 0 ? ['even'] : ['odd'],
+            keysecondary: [], content: uid === 3 ? 'needle inside' : `content ${uid}`, order: uid,
+        };
+    }
+    stubHost({ chat: [], loadWorldInfo: async () => ({ entries }) });
+
+    const first = await executeCapability(EXTENSION_ID, 'worlds.entries', { name: 'Lore', limit: 5 });
+    assert.equal(first.data.total, 12);
+    assert.equal(first.data.entries.length, 5);
+    assert.equal(first.data.hasMore, true);
+    assert.deepEqual(first.data.entries.map(entry => entry.uid), ['0', '1', '2', '3', '4']);
+
+    const second = await executeCapability(EXTENSION_ID, 'worlds.entries', { name: 'Lore', limit: 5, offset: 10 });
+    assert.deepEqual(second.data.entries.map(entry => entry.uid), ['10', '11']);
+    assert.equal(second.data.hasMore, false, 'the last page reports no more');
+    assert.equal(second.data.offset, 10);
+
+    const searched = await executeCapability(EXTENSION_ID, 'worlds.entries', { name: 'Lore', query: 'NEEDLE' });
+    assert.equal(searched.data.total, 1, 'search is case-insensitive and covers content');
+    assert.deepEqual(searched.data.entries.map(entry => entry.uid), ['3']);
+
+    const byKey = await executeCapability(EXTENSION_ID, 'worlds.entries', { name: 'Lore', query: 'even' });
+    assert.equal(byKey.data.total, 6, 'keys are searchable');
+
+    const none = await executeCapability(EXTENSION_ID, 'worlds.entries', { name: 'Lore', query: 'nothing-matches' });
+    assert.deepEqual(none.data, { name: 'Lore', total: 0, offset: 0, limit: 200, hasMore: false, entries: [] });
+
+    const beyond = await executeCapability(EXTENSION_ID, 'worlds.entries', { name: 'Lore', offset: 99 });
+    assert.deepEqual(beyond.data.entries, [], 'an offset past the end is empty, not an error');
+    assert.equal(beyond.data.total, 12);
+
+    const badOffset = await executeCapability(EXTENSION_ID, 'worlds.entries', { name: 'Lore', offset: -1 });
+    assert.equal(badOffset.error.code, 'INVALID_INPUT');
 });
 
 test('returns no entries for a world book that has none, and reports unsupported hosts', async () => {
     stubHost({ chat: [], loadWorldInfo: async () => ({ entries: {} }) });
     assert.deepEqual(await executeCapability(EXTENSION_ID, 'worlds.entries', { name: 'Empty' }), {
-        success: true, data: [],
+        success: true,
+        data: { name: 'Empty', total: 0, offset: 0, limit: 200, hasMore: false, entries: [] },
     });
 
     stubHost({ chat: [], loadWorldInfo: async () => undefined });
     assert.deepEqual(await executeCapability(EXTENSION_ID, 'worlds.entries', { name: 'Missing' }), {
-        success: true, data: [],
+        success: true,
+        data: { name: 'Missing', total: 0, offset: 0, limit: 200, hasMore: false, entries: [] },
     });
 
     stubHost({ chat: [] });

@@ -298,10 +298,11 @@ async function probeLiveReads(cdp) {
 
     const worldName = worlds.data[0];
     const entries = await cdp.evaluate(`return await window.Loom.executeCapability('loom-host', 'worlds.entries', { name: ${JSON.stringify(worldName)} });`);
-    assertThat('worlds.entries reads a live world book', entries.success && Array.isArray(entries.data),
-        `${worldName}: ${entries.data?.length ?? entries.error?.code} entries`);
-    if (entries.success && entries.data.length > 0) {
-        const entry = entries.data[0];
+    assertThat('worlds.entries reads a live world book',
+        entries.success && Array.isArray(entries.data?.entries),
+        `${worldName}: ${entries.data?.total ?? entries.error?.code} entries`);
+    if (entries.success && entries.data.entries.length > 0) {
+        const entry = entries.data.entries[0];
         assertThat('world entry mapping keeps identity and content',
             typeof entry.uid === 'string' && typeof entry.content === 'string' && Array.isArray(entry.keys),
             `uid=${entry.uid}, keys=${entry.keys.length}, content=${entry.content.length}`);
@@ -533,7 +534,7 @@ async function probeWorldExportImport(cdp) {
 
     const roundTrip = await cdp.evaluate(`const entries = await window.Loom.executeCapability('loom-host', 'worlds.entries',
         { name: ${JSON.stringify(SCRATCH_COPY)} });
-        const entry = entries.data?.[0] ?? null;
+        const entry = entries.data?.entries?.[0] ?? null;
         return { entry, sameUid: String(entry?.uid) === ${JSON.stringify(String(created.uid ?? ''))} };`);
     assertThat('the imported copy carries the same entry content',
         roundTrip.entry?.content === 'exported content'
@@ -557,7 +558,7 @@ async function probeWorldExportImport(cdp) {
         const entries = await Loom.executeCapability('loom-host', 'worlds.entries', { name: ${JSON.stringify(SCRATCH_BOOK)} });
         const removed = await Loom.executeCapability('loom-host', 'worlds.remove',
             { name: ${JSON.stringify(SCRATCH_BOOK)}, confirm: ${JSON.stringify(SCRATCH_BOOK)} }, { caller: 'verify-probe' });
-        return { created: created.success, entries: (entries.data ?? []).length, removed: removed.success };`);
+        return { created: created.success, entries: entries.data?.total ?? 0, removed: removed.success };`);
     assertThat('a recreated book starts empty and is removed again',
         reused.created === true && reused.entries === 0 && reused.removed === true, JSON.stringify(reused));
 }
@@ -597,7 +598,7 @@ async function probeWorldWrite(cdp) {
     const uid = String(created.data?.uid);
     const readBack = await cdp.evaluate(`return await window.Loom.executeCapability('loom-host', 'worlds.entries',
         { name: ${JSON.stringify(SCRATCH_BOOK)} });`);
-    const written = readBack.data?.find(entry => entry.uid === uid);
+    const written = readBack.data?.entries?.find(entry => entry.uid === uid);
     assertThat('the created entry is readable back from the host', Boolean(written) && written.content === '第一版',
         JSON.stringify(written ?? null).slice(0, 90));
 
@@ -609,7 +610,7 @@ async function probeWorldWrite(cdp) {
 
     const afterUpdate = await cdp.evaluate(`return await window.Loom.executeCapability('loom-host', 'worlds.entries',
         { name: ${JSON.stringify(SCRATCH_BOOK)} });`);
-    const changed = afterUpdate.data?.find(entry => entry.uid === uid);
+    const changed = afterUpdate.data?.entries?.find(entry => entry.uid === uid);
     assertThat('the update is persisted and enabled maps to disable',
         Boolean(changed) && changed.content === '第二版' && changed.enabled === false,
         JSON.stringify(changed ?? null).slice(0, 90));
@@ -622,7 +623,7 @@ async function probeWorldWrite(cdp) {
     const afterRemove = await cdp.evaluate(`return await window.Loom.executeCapability('loom-host', 'worlds.entries',
         { name: ${JSON.stringify(SCRATCH_BOOK)} });`);
     assertThat('the removed entry is gone from the book',
-        afterRemove.success === true && !afterRemove.data.some(entry => entry.uid === uid));
+        afterRemove.success === true && !afterRemove.data?.entries?.some(entry => entry.uid === uid));
 
     // The whole book is deleted through Loom, closing the lifecycle end to end.
     const removedBook = await cdp.evaluate(`return await window.Loom.executeCapability('loom-host', 'worlds.remove',
@@ -1459,7 +1460,7 @@ async function probeWorldBookManager(cdp) {
         launcher.button === true && launcher.panel === true && launcher.hidden === true,
         JSON.stringify(launcher));
 
-    // Prepare a scratch book with one entry, then drive the manager's real DOM.
+    // Twelve entries so the manager's page size (8) produces a second page.
     const scratch = await cdp.evaluate(`const Loom = window.Loom;
         // The install probe reloads the page, which drops dynamically registered
         // extensions; the harness registers its probe again where needed.
@@ -1468,14 +1469,18 @@ async function probeWorldBookManager(cdp) {
         }
         if (!Loom.checkPermission('verify-probe', 'host.worldinfo.manage')) Loom.grantPermission('verify-probe', 'host.worldinfo.manage');
         const created = await Loom.executeCapability('loom-host', 'worlds.create', { name: ${JSON.stringify(WBM_BOOK)} }, { caller: 'verify-probe' });
-        const entry = await Loom.executeCapability('loom-host', 'worlds.entry.create',
-            { name: ${JSON.stringify(WBM_BOOK)}, entry: { comment: 'manager probe', content: 'original content', keys: ['probe'] } },
-            { caller: 'verify-probe' });
+        let entriesOk = true;
+        for (let index = 0; index < 12; index += 1) {
+            const entry = await Loom.executeCapability('loom-host', 'worlds.entry.create',
+                { name: ${JSON.stringify(WBM_BOOK)}, entry: { comment: 'probe entry ' + index, content: 'content ' + index, keys: ['probe'], order: index } },
+                { caller: 'verify-probe' });
+            entriesOk = entriesOk && entry.success === true;
+        }
         // A declared permission is requested at activation; granting it here is
         // what the user does in the consent prompt.
         Loom.grantPermission('world-book-manager', 'host.worldinfo.write');
         document.getElementById('loom_wbm_button').click();
-        return { created: created.success === true, entry: entry.success === true, error: created.error?.code ?? entry.error?.code ?? null };`);
+        return { created: created.success === true, entry: entriesOk, error: created.error?.code ?? null };`);
     assertThat('the scratch book for the manager is ready', scratch.created === true && scratch.entry === true, JSON.stringify(scratch));
 
     const opened = await cdp.waitFor(
@@ -1488,17 +1493,47 @@ async function probeWorldBookManager(cdp) {
     );
     assertThat('the manager lists the scratch book', Boolean(opened) && opened.options >= 1, JSON.stringify(opened));
 
-    const edited = await cdp.evaluate(`const panel = document.getElementById('loom_wbm_panel');
-        const selects = panel.querySelectorAll('select');
-        const bookSelect = selects[0];
+    const paged = await cdp.evaluate(`const panel = document.getElementById('loom_wbm_panel');
+        const bookSelect = panel.querySelectorAll('select')[0];
         bookSelect.value = ${JSON.stringify(WBM_BOOK)};
         bookSelect.dispatchEvent(new Event('change'));
-        await new Promise(resolve => setTimeout(resolve, 400));
+        await new Promise(resolve => setTimeout(resolve, 600));
+        const uids = () => [...panel.querySelectorAll('select')[1].options].map(option => option.value);
+        const firstPage = uids();
+        const firstRange = panel.textContent.includes('1–8 / 12');
+        [...panel.querySelectorAll('button')].find(button => button.textContent === '下一页')?.click();
+        await new Promise(resolve => setTimeout(resolve, 600));
+        const secondPage = uids();
+        return { firstPage, firstRange, secondPage, secondRange: panel.textContent.includes('9–12 / 12') };`);
+    assertThat('the manager pages a twelve-entry book',
+        paged.firstPage.length === 8 && paged.firstRange === true
+        && paged.secondPage.length === 4 && paged.secondRange === true,
+        JSON.stringify(paged));
+
+    const searched = await cdp.evaluate(`const panel = document.getElementById('loom_wbm_panel');
+        const search = [...panel.querySelectorAll('input')].find(input => input.placeholder.includes('搜索'));
+        search.value = 'probe entry 1';
+        search.dispatchEvent(new Event('change'));
+        await new Promise(resolve => setTimeout(resolve, 600));
+        return {
+            uids: [...panel.querySelectorAll('select')[1].options].map(option => option.value),
+            text: panel.textContent.includes('3 条'),
+        };`);
+    assertThat('the manager searches entries and reports the match count',
+        searched.uids.length === 3 && searched.text === true, JSON.stringify(searched));
+
+    const edited = await cdp.evaluate(`const panel = document.getElementById('loom_wbm_panel');
+        const search = [...panel.querySelectorAll('input')].find(input => input.placeholder.includes('搜索'));
+        search.value = '';
+        search.dispatchEvent(new Event('change'));
+        await new Promise(resolve => setTimeout(resolve, 500));
+        [...panel.querySelectorAll('button')].find(button => button.textContent === '上一页')?.click();
+        await new Promise(resolve => setTimeout(resolve, 500));
         const entrySelect = panel.querySelectorAll('select')[1];
         if (!entrySelect || entrySelect.options.length === 0) return { ok: false, reason: 'no entries listed' };
         entrySelect.value = entrySelect.options[0].value;
         entrySelect.dispatchEvent(new Event('change'));
-        await new Promise(resolve => setTimeout(resolve, 300));
+        await new Promise(resolve => setTimeout(resolve, 400));
         const textarea = panel.querySelector('textarea');
         if (!textarea) return { ok: false, reason: 'no textarea' };
         textarea.value = 'edited through the manager';
@@ -1506,7 +1541,7 @@ async function probeWorldBookManager(cdp) {
         const save = [...panel.querySelectorAll('button')].find(button => button.textContent === '保存');
         if (!save) return { ok: false, reason: 'no save button' };
         save.click();
-        await new Promise(resolve => setTimeout(resolve, 600));
+        await new Promise(resolve => setTimeout(resolve, 800));
         return { ok: true, status: panel.textContent.includes('已保存'), text: panel.textContent.slice(-200) };`);
     assertThat('the manager drives a real save through its UI',
         edited.ok === true && edited.status === true, JSON.stringify(edited));
@@ -1515,7 +1550,7 @@ async function probeWorldBookManager(cdp) {
         { name: ${JSON.stringify(WBM_BOOK)} }, { caller: 'verify-probe' });`);
     assertThat('the manager edit reached the world book',
         persisted.success === true
-        && (persisted.data ?? []).some(entry => entry.content === 'edited through the manager'),
+        && (persisted.data?.entries ?? []).some(entry => entry.content === 'edited through the manager'),
         JSON.stringify(persisted.data ?? persisted.error));
 
     const closed = await cdp.evaluate(`document.getElementById('loom_wbm_button').click();
@@ -1656,7 +1691,7 @@ async function probeWorldRename(cdp) {
         return {
             oldGone: !names.includes(${JSON.stringify(RENAME_SRC)}),
             newListed: names.includes(${JSON.stringify(RENAME_DST)}),
-            contents: (entries.data ?? []).map(entry => entry.content),
+            contents: (entries.data?.entries ?? []).map(entry => entry.content),
             chatBinding: context.chatMetadata?.world_info ?? null,
             personaBinding: context.powerUserSettings?.persona_description_lorebook ?? null,
             selected: select ? [...select.options].filter(option => option.selected).map(option => option.value) : null,

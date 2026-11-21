@@ -3,28 +3,35 @@
  *
  * 演示：
  * - 激活时声明 `host.worldinfo.write`（加载器会先征求用户同意）；
- * - 用 `worlds.list` / `worlds.export` 读取，用 `worlds.entry.update` 写回；
+ * - 用 `worlds.list` / `worlds.entries`（分页 + 搜索）/ `worlds.export` 读取；
+ * - 用 `worlds.entry.update` 写回；
  * - 用 LoomUI 声明式视图渲染界面，事件处理器更新状态后重建视图；
  * - 把权限被拒等真实结果如实显示给用户。
  *
- * 读取用 `worlds.export` 而不是 `worlds.entries`：后者为了展示会把内容截断到
- * 2000 字，拿截断的内容回写会毁数据。
+ * 列表用 `worlds.entries` 分页（内容截断到 2000 字只用于展示）；选中条目后
+ * 才用 `worlds.export` 取完整内容，避免为列表加载整本书。
  */
 
 const HOST = 'loom-host';
 const PANEL_ID = 'loom_wbm_panel';
 const BUTTON_ID = 'loom_wbm_button';
+const PAGE_SIZE = 8;
 
 const state = {
     books: [],
     book: '',
     entries: [],
-    fullEntries: {},
+    total: 0,
+    offset: 0,
+    hasMore: false,
+    query: '',
     uid: null,
     comment: '',
     enabled: true,
     content: '',
     status: '选择一本世界书开始。',
+    cacheBook: '',
+    cache: {},
 };
 
 let extensionId = null;
@@ -70,7 +77,7 @@ function renderPanel() {
     const container = document.createElement('div');
     container.id = PANEL_ID;
     container.style.cssText = [
-        'position:fixed', 'right:16px', 'bottom:72px', 'width:380px', 'max-height:70vh',
+        'position:fixed', 'right:16px', 'bottom:72px', 'width:400px', 'max-height:70vh',
         'overflow:auto', 'z-index:30000', 'padding:12px', 'border-radius:8px',
         'border:1px solid var(--SmartThemeBorderColor, #777)',
         'background:var(--SmartThemeBlurTintColor, #1e1e1e)',
@@ -90,10 +97,17 @@ function refresh() {
     }
 }
 
+function rangeLabel() {
+    if (state.total === 0) return '0 / 0';
+    const start = state.offset + 1;
+    const end = state.offset + state.entries.length;
+    return `${start}–${end} / ${state.total}`;
+}
+
 function buildTree() {
     return {
         component: 'card',
-        props: { title: '世界书管理器', subtitle: '读取完整条目，保存后显示真实结果' },
+        props: { title: '世界书管理器', subtitle: '分页与搜索，保存后显示真实结果' },
         children: [
             {
                 component: 'column',
@@ -108,6 +122,11 @@ function buildTree() {
                         on: { change: event => void selectBook(event.payload.value) },
                     },
                     {
+                        component: 'input',
+                        props: { value: state.query, placeholder: '搜索备注 / 关键词 / 内容' },
+                        on: { change: event => void search(event.payload.value) },
+                    },
+                    {
                         component: 'select',
                         props: {
                             options: state.entries.map(entry => ({
@@ -117,6 +136,15 @@ function buildTree() {
                             value: state.uid === null ? '' : String(state.uid),
                         },
                         on: { change: event => void selectEntry(event.payload.value) },
+                    },
+                    {
+                        component: 'row',
+                        props: { gap: 6 },
+                        children: [
+                            { component: 'button', props: { label: '上一页', disabled: state.offset === 0 }, on: { click: () => void goPage(-1) } },
+                            { component: 'button', props: { label: '下一页', disabled: !state.hasMore }, on: { click: () => void goPage(1) } },
+                            { component: 'text', props: { text: rangeLabel() } },
+                        ],
                     },
                     {
                         component: 'row',
@@ -175,39 +203,91 @@ async function loadBooks() {
     refresh();
 }
 
+async function loadEntries({ silent = false } = {}) {
+    if (!state.book) {
+        state.entries = [];
+        state.total = 0;
+        state.hasMore = false;
+        refresh();
+        return;
+    }
+    try {
+        const page = await callHost('worlds.entries', {
+            name: state.book,
+            limit: PAGE_SIZE,
+            offset: state.offset,
+            ...(state.query ? { query: state.query } : {}),
+        });
+        state.entries = page.entries;
+        state.total = page.total;
+        state.hasMore = page.hasMore;
+        // A caller that already has something to say (e.g. "saved") keeps its
+        // status; reloading the page must not overwrite the outcome of the write.
+        if (!silent) {
+            state.status = state.query
+                ? `搜索「${state.query}」：${page.total} 条。`
+                : `已载入 ${page.total} 个条目。`;
+        }
+    } catch (error) {
+        state.status = error.message;
+    }
+    refresh();
+}
+
 async function selectBook(name) {
     state.book = name;
     state.uid = null;
+    state.offset = 0;
+    state.query = '';
     state.entries = [];
-    state.fullEntries = {};
+    state.total = 0;
     state.content = '';
     state.comment = '';
-    if (name) {
-        try {
-            // `worlds.export` returns the raw book: entries are complete, unlike the
-            // 2000-character preview `worlds.entries` exposes.
-            const exported = await callHost('worlds.export', { name });
-            state.fullEntries = exported.data?.entries ?? {};
-            state.entries = Object.entries(state.fullEntries)
-                .map(([uid, entry]) => ({ uid: Number(entry?.uid ?? uid), comment: String(entry?.comment ?? '') }))
-                .sort((left, right) => left.uid - right.uid);
-            state.status = `已载入 ${state.entries.length} 个条目。`;
-        } catch (error) {
-            state.status = error.message;
-        }
-    }
-    refresh();
+    state.cacheBook = '';
+    state.cache = {};
+    await loadEntries();
+}
+
+async function search(value) {
+    state.query = String(value ?? '').trim();
+    state.offset = 0;
+    await loadEntries();
+}
+
+async function goPage(direction) {
+    const next = state.offset + direction * PAGE_SIZE;
+    if (next < 0) return;
+    state.offset = next;
+    await loadEntries();
+}
+
+async function ensureCache() {
+    if (state.cacheBook === state.book) return;
+    // Full content is only needed once an entry is selected; the list itself is
+    // served by worlds.entries, which truncates for display.
+    const exported = await callHost('worlds.export', { name: state.book });
+    state.cache = exported.data?.entries ?? {};
+    state.cacheBook = state.book;
 }
 
 async function selectEntry(value) {
     const uid = Number(value);
     state.uid = Number.isFinite(uid) ? uid : null;
-    const entry = state.uid === null ? null : state.fullEntries[String(state.uid)];
-    if (entry) {
-        state.content = String(entry.content ?? '');
-        state.comment = String(entry.comment ?? '');
-        state.enabled = entry.disable !== true;
-        state.status = `条目 ${state.uid} 已载入。`;
+    if (state.uid !== null) {
+        try {
+            await ensureCache();
+        } catch (error) {
+            state.status = error.message;
+            refresh();
+            return;
+        }
+        const entry = state.cache[String(state.uid)];
+        if (entry) {
+            state.content = String(entry.content ?? '');
+            state.comment = String(entry.comment ?? '');
+            state.enabled = entry.disable !== true;
+            state.status = `条目 ${state.uid} 已载入。`;
+        }
     }
     refresh();
 }
@@ -221,18 +301,19 @@ async function saveEntry() {
     try {
         await callHost('worlds.entry.update', {
             name: state.book,
-            // The capability contract uses string uids (`worlds.entry.create`
-            // returns one), so the numeric selection is converted here.
             uid: String(state.uid),
             patch: { content: state.content, comment: state.comment, enabled: state.enabled },
         });
-        state.fullEntries[String(state.uid)] = {
-            ...(state.fullEntries[String(state.uid)] ?? {}),
+        state.cache[String(state.uid)] = {
+            ...(state.cache[String(state.uid)] ?? {}),
             content: state.content,
             comment: state.comment,
             disable: !state.enabled,
         };
+        await loadEntries({ silent: true });
         state.status = `条目 ${state.uid} 已保存。`;
+        refresh();
+        return;
     } catch (error) {
         state.status = error.message;
     }

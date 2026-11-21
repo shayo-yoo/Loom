@@ -1,5 +1,6 @@
 # Change Log
 
+- [CHG-20261122-033](history/recent/CHG-20261122-033.md): `worlds.entries` pagination and search (breaking page object), manager paging/search, save status fix (0.30.0).
 - [CHG-20261122-032](history/recent/CHG-20261122-032.md): `worlds.rename` can migrate character-card links when asked (`migrateCards`) and separately authorised; embedded books still block (0.29.0).
 - [CHG-20261122-031](history/recent/CHG-20261122-031.md): Character card lifecycle — `characters.create`/`characters.remove` behind `host.characters.manage`, name-echo deletion, open-character refusal (0.28.0).
 - [CHG-20261122-030](history/recent/CHG-20261122-030.md): Loom buttons collapsed to `min-content` by SillyTavern's global `.menu_button` rule — intrinsic width restored, layout pinned by the browser harness (0.28.0).
