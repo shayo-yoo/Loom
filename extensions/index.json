@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "extensions": [
+    {
+      "id": "hello-loom",
+      "name": "Hello Loom",
+      "version": "0.1.0",
+      "description": "Loom 的示例扩展：注册一个问候能力，并把调用次数持久化。",
+      "manifest": "extensions/hello-loom/manifest.json",
+      "entry": "extensions/hello-loom/index.js",
+      "dependencies": [],
+      "permissions": []
+    }
+  ]
+}

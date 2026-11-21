@@ -1,11 +1,12 @@
 {
     "name": "loom",
-    "version": "0.25.0",
+    "version": "0.26.0",
     "private": true,
     "type": "module",
     "scripts": {
         "test": "node --test",
-        "verify:browser": "node tests/browser/verify.mjs"
+        "verify:browser": "node tests/browser/verify.mjs",
+        "extensions:index": "node scripts/extensions-index.mjs"
     },
     "engines": {
         "node": ">=20"

@@ -1,5 +1,6 @@
 # Change Log
 
+- [CHG-20261121-028](history/recent/CHG-20261121-028.md): Extension discovery and installation — package convention, generated index, persisted installs, panel install section, example `hello-loom` (0.26.0).
 - [CHG-20261121-027](history/recent/CHG-20261121-027.md): `chat.append` allowlist fix — default type had no host template; real append verified on a scratch chat (0.25.0).
 - [CHG-20261121-026](history/recent/CHG-20261121-026.md): Message edit/delete — `chat.edit`/`chat.delete` with `expect` echo, undo token, and host-side cascade (0.24.0).
 - [CHG-20261121-025](history/recent/CHG-20261121-025.md): Character card write — `characters.update` through the host's `merge-attributes`, field-scoped writes (0.23.0).

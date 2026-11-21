@@ -34,6 +34,13 @@ import {
     buildConsentNodes,
     summarizeRequests,
 } from './consent.js';
+import {
+    describeInstalled,
+    forgetInstalled,
+    normalizeIndex,
+    normalizeUserSource,
+    rememberInstalled,
+} from './installer.js';
 
 const PANEL_ID = 'loom_panel';
 const EXTENSION_BUTTON_ID = 'loom_extension_button';
@@ -51,6 +58,21 @@ const HOST_EVENTS = Object.freeze([
 
 let eventsWired = false;
 let consentView = null;
+
+/**
+ * Extension installer.
+ *
+ * Bundled packages (`extensions/index.json`) load on every boot. User-installed
+ * modules are remembered in this extension's persisted state and re-imported on
+ * the next boot. Both go through `runtime.importExtension`, so Core keeps
+ * identity, dependency and failure handling in one place.
+ */
+const INSTALLER_SECTION_ID = 'loom_installer';
+const INSTALL_STATE_KEY = 'installedExtensions';
+const LOOM_ROOT = new URL('../', import.meta.url);
+const bundledSources = [];
+const installProblems = [];
+let installedEntries = [];
 
 function ensureExtension() {
     if (!runtime?.registerExtension || runtime.listExtensions().some(extension => extension.id === EXTENSION_ID)) {
@@ -72,6 +94,203 @@ function installBuiltinComponents() {
     for (const component of BUILTIN_COMPONENTS) {
         registerComponent(EXTENSION_ID, component);
     }
+}
+
+let installerBooted = false;
+
+function readInstalledEntries() {
+    const stored = runtime?.getState?.(EXTENSION_ID, INSTALL_STATE_KEY);
+    return Array.isArray(stored) ? stored.filter(entry => entry && typeof entry.entry === 'string') : [];
+}
+
+function persistInstalledEntries(list) {
+    installedEntries = list;
+    runtime?.setState?.(EXTENSION_ID, INSTALL_STATE_KEY, list);
+}
+
+async function loadBundledIndex() {
+    const url = new URL('extensions/index.json', LOOM_ROOT);
+    try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        // Package paths in the index are relative to Loom's root, not to the
+        // index file itself (`extensions/foo/index.js`, not `foo/index.js`).
+        return normalizeIndex(await response.json(), LOOM_ROOT.href);
+    } catch {
+        // No index is a valid install: Loom can run with bundled packages only.
+        return { sources: [], problems: [] };
+    }
+}
+
+async function fetchManifest(url) {
+    if (!url) return null;
+    try {
+        const response = await fetch(url);
+        if (!response.ok) return null;
+        const parsed = await response.json();
+        return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+        return null;
+    }
+}
+
+async function importSource(source) {
+    const manifest = source.manifest ? await fetchManifest(source.manifest) : null;
+    const options = manifest ? { manifest } : {};
+    let result;
+    try {
+        result = await runtime.importExtension(source.entry, options);
+    } catch (error) {
+        result = { state: 'failed', error: { message: error instanceof Error ? error.message : String(error) } };
+    }
+    if (result?.state === 'failed' || result?.error) {
+        installProblems.push(`${source.id ?? source.entry}: ${result?.error?.message ?? '导入失败'}`);
+    }
+    return result;
+}
+
+async function bootExtensions() {
+    if (installerBooted) return;
+    installerBooted = true;
+
+    installProblems.length = 0;
+    installedEntries = readInstalledEntries();
+
+    const index = await loadBundledIndex();
+    bundledSources.push(...index.sources);
+    installProblems.push(...index.problems);
+
+    for (const source of bundledSources) {
+        await importSource(source);
+    }
+    for (const entry of installedEntries) {
+        if (bundledSources.some(source => source.entry === entry.entry)) continue;
+        await importSource({ ...entry, manifest: entry.manifest ?? '', bundled: false });
+    }
+
+    renderInstaller();
+    renderExtensionStates();
+}
+
+async function installExtension(url) {
+    const { source, error } = normalizeUserSource(null, url, LOOM_ROOT.href);
+    if (error) throw new Error(error);
+
+    const already = installedEntries.find(entry => entry.entry === source.entry);
+    if (already?.id && runtime?.getExtensionState?.(already.id)?.state === 'active') {
+        return already.entry;
+    }
+
+    const result = await importSource({ ...source, manifest: source.manifest ?? '' });
+    if (result?.state === 'failed' || result?.error) {
+        throw new Error(result?.error?.message ?? '导入失败');
+    }
+    persistInstalledEntries(rememberInstalled(installedEntries, {
+        id: result?.id ?? source.id ?? null,
+        entry: source.entry,
+        bundled: false,
+    }));
+    renderInstaller();
+    renderExtensionStates();
+    return source.entry;
+}
+
+async function uninstallExtension(target) {
+    const entry = installedEntries.find(item => item.id === target || item.entry === target);
+    if (!entry) throw new Error(`未找到已安装扩展：${target}`);
+    if (entry.id) runtime?.unloadExtension?.(entry.id);
+    persistInstalledEntries(forgetInstalled(installedEntries, target));
+    renderInstaller();
+    renderExtensionStates();
+    return entry.entry;
+}
+
+function renderInstaller() {
+    const list = document.getElementById(`${INSTALLER_SECTION_ID}_list`);
+    const problems = document.getElementById(`${INSTALLER_SECTION_ID}_problems`);
+    if (!list) return;
+
+    const sources = [];
+    const seen = new Set();
+    for (const source of [...bundledSources, ...installedEntries]) {
+        if (!source?.entry || seen.has(source.entry)) continue;
+        seen.add(source.entry);
+        sources.push(source);
+    }
+    const states = sources.map(source => (source.id ? runtime?.getExtensionState?.(source.id) : null)).filter(Boolean);
+    const rows = describeInstalled(sources, states);
+
+    list.innerHTML = rows.length === 0
+        ? '<p class="loom_hint">还没有扩展。把扩展目录放进 extensions/ 并运行 npm run extensions:index，或粘贴模块地址手动安装。</p>'
+        : rows.map(row => {
+            const meta = [row.bundled ? '内置' : '手动安装', row.state].filter(Boolean).join(' · ');
+            const remove = row.bundled
+                ? ''
+                : `<button type="button" class="menu_button" data-loom-uninstall="${escapeHtml(row.id || row.entry)}">移除</button>`;
+            return `
+                <div class="loom_install_row">
+                    <div class="loom_install_main">
+                        <strong>${escapeHtml(row.name || row.id || row.entry)}</strong>
+                        <span class="loom_hint">${escapeHtml(meta)}</span>
+                        ${row.error ? `<span class="loom_install_error">${escapeHtml(row.error)}</span>` : ''}
+                    </div>
+                    ${remove}
+                </div>`;
+        }).join('');
+
+    if (problems) {
+        problems.innerHTML = installProblems.length === 0
+            ? ''
+            : `<p class="loom_hint">安装问题：</p>${installProblems.map(problem => `<p class="loom_install_error">${escapeHtml(problem)}</p>`).join('')}`;
+    }
+}
+
+function mountInstallerSection() {
+    if (document.getElementById(INSTALLER_SECTION_ID)) return;
+    const content = document.querySelector(`#${PANEL_ID} .loom_panel_content`);
+    if (!content) return;
+
+    const section = document.createElement('section');
+    section.id = INSTALLER_SECTION_ID;
+    section.innerHTML = `
+        <h3>扩展安装</h3>
+        <div class="loom_installer_controls">
+            <input type="text" id="${INSTALLER_SECTION_ID}_url" placeholder="模块地址，例如 extensions/hello-loom/index.js" />
+            <button type="button" class="menu_button" id="${INSTALLER_SECTION_ID}_button">安装</button>
+        </div>
+        <p class="loom_hint">内置扩展随 Loom 加载；手动安装的模块记在本扩展状态里，刷新后自动恢复。</p>
+        <div id="${INSTALLER_SECTION_ID}_list"></div>
+        <div id="${INSTALLER_SECTION_ID}_problems"></div>
+    `;
+    content.append(section);
+
+    section.querySelector(`#${INSTALLER_SECTION_ID}_button`)?.addEventListener('click', async event => {
+        const input = section.querySelector(`#${INSTALLER_SECTION_ID}_url`);
+        const button = event.currentTarget;
+        const value = input?.value?.trim() ?? '';
+        if (!value) return;
+        button.disabled = true;
+        try {
+            await installExtension(value);
+            if (input) input.value = '';
+        } catch (error) {
+            installProblems.push(error instanceof Error ? error.message : String(error));
+            renderInstaller();
+        } finally {
+            button.disabled = false;
+        }
+    });
+    section.addEventListener('click', async event => {
+        const button = event.target.closest('[data-loom-uninstall]');
+        if (!button) return;
+        button.disabled = true;
+        try {
+            await uninstallExtension(button.dataset.loomUninstall);
+        } catch (error) {
+            installProblems.push(error instanceof Error ? error.message : String(error));
+            renderInstaller();
+        }
+    });
 }
 
 function installUiApi() {
@@ -99,6 +318,12 @@ function installUiApi() {
         serializeView: (viewId) => serializeView(viewId),
         serializeNode: (node) => serializeNode(node),
         destroyAllViews: (extensionId) => destroyAllViews(extensionId),
+        installExtension: (url) => installExtension(url),
+        uninstallExtension: (target) => uninstallExtension(target),
+        getInstalledExtensions: () => describeInstalled(
+            [...bundledSources, ...installedEntries],
+            bundledSources.map(source => runtime?.getExtensionState?.(source.id)).filter(Boolean),
+        ),
     });
     globalThis.LoomUI = ui;
     runtime.registerCapability(EXTENSION_ID, {
@@ -403,6 +628,7 @@ function renderPanel() {
     renderEvents();
     renderPermissions();
     renderExtensionStates();
+    renderInstaller();
     renderUiSummary();
     renderIdentityConflicts();
     updateSettingsEntry();
@@ -529,6 +755,7 @@ function installPanel() {
         </div>
     `;
     document.body.append(panel);
+    mountInstallerSection();
     document.getElementById('loom_close').addEventListener('click', closePanel);
     document.getElementById('loom_refresh').addEventListener('click', renderPanel);
     // Delegated: the permission list is re-rendered on every toggle, so bind to
@@ -586,6 +813,7 @@ function initialize() {
     installSettingsEntry();
     // Catches requests raised before this entry subscribed to the event.
     renderConsent();
+    void bootExtensions();
     const settingsReady = document.getElementById(SETTINGS_ENTRY_ID);
     if (!document.getElementById(EXTENSION_BUTTON_ID) || !settingsReady) {
         setTimeout(initialize, 500);

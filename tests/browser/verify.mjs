@@ -1211,6 +1211,61 @@ async function probeCharacterWrite(cdp) {
     }
 }
 
+async function probeExtensionInstall(cdp) {
+    // Bundled discovery: hello-loom ships with Loom and must be indexed and active.
+    const bundled = await cdp.evaluate(`const Loom = window.Loom;
+        const response = await fetch('/scripts/extensions/third-party/Loom/extensions/index.json');
+        const index = response.ok ? await response.json() : null;
+        const state = Loom.getExtensionState('hello-loom');
+        const call = await Loom.executeCapability('hello-loom', 'hello.greet', { name: 'Loom' });
+        return { indexed: index?.extensions?.some(entry => entry.id === 'hello-loom') ?? false, state: state?.state ?? null, call };`);
+    assertThat('the bundled index is served and lists hello-loom',
+        bundled.indexed === true, JSON.stringify({ indexed: bundled.indexed }));
+    assertThat('the bundled extension is active and its capability runs',
+        bundled.state === 'active' && bundled.call.success === true
+        && bundled.call.data?.message === 'Hello, Loom!',
+        JSON.stringify({ state: bundled.state, call: bundled.call }));
+    const listed = await cdp.waitFor(
+        "return document.getElementById('loom_installer')?.textContent.includes('Hello Loom') ? true : false;",
+        SETTLE_TIMEOUT_MS, 'installer listing the bundled extension',
+    );
+    assertThat('the panel has an install section listing the bundled extension', listed === true);
+
+    // User install: a module URL is imported and remembered; a reload restores it.
+    const installed = await cdp.evaluate(`const source = 'data:text/javascript,${encodeURIComponent(
+        'export default { id: "verify-installed", name: "Installed Probe" };',
+    )}';
+        const entry = await window.LoomUI.installExtension(source);
+        const stored = window.Loom.getState('loom-ui', 'installedExtensions') ?? [];
+        const state = window.Loom.getExtensionState('verify-installed');
+        return { entry, stored, state: state?.state ?? null };`);
+    assertThat('a user-installed module loads and is remembered',
+        installed.state === 'active'
+        && (installed.stored ?? []).some(item => item.id === 'verify-installed'),
+        JSON.stringify(installed));
+
+    // Extension state persists through SillyTavern's debounced settings save.
+    await cdp.evaluate('await new Promise(resolve => setTimeout(resolve, 2000)); return true;');
+    await cdp.send('Page.navigate', { url: ST_URL });
+    await cdp.waitFor("return Boolean(document.getElementById('loom_installer'));", READY_TIMEOUT_MS, 'installer after reload');
+    const restored = await cdp.waitFor(
+        `return window.Loom?.getExtensionState('verify-installed')?.state ?? false;`,
+        SETTLE_TIMEOUT_MS, 'installed module restored after reload',
+    );
+    assertThat('the installed module is restored after a reload', restored === 'active', `state=${restored}`);
+
+    const removed = await cdp.evaluate(`await window.LoomUI.uninstallExtension('verify-installed');
+        const stored = window.Loom.getState('loom-ui', 'installedExtensions') ?? [];
+        return {
+            stored,
+            stillRegistered: window.Loom.listExtensions().some(entry => entry.id === 'verify-installed'),
+        };`);
+    assertThat('uninstalling removes the module and forgets it',
+        removed.stillRegistered === false
+        && !(removed.stored ?? []).some(item => item.id === 'verify-installed'),
+        JSON.stringify(removed));
+}
+
 async function probeWorldRename(cdp) {
     await cdp.evaluate(`const Loom = window.Loom;
         if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) Loom.loadExtension({ id: 'verify-probe', name: 'Verify Probe' });
@@ -1379,9 +1434,20 @@ async function cleanup(cdp) {
         }
         // Wait for the debounced save to flush before the browser is killed.
         await cdp.evaluate('await new Promise(resolve => setTimeout(resolve, 2000)); return true;');
-        const remaining = await cdp.evaluate(`return window.SillyTavern.getContext().extensionSettings.__loom ?? null;`);
-        if (remaining !== null) record('cleanup removed the test grants', false, JSON.stringify(remaining));
-        else record('cleanup removed the test grants', true);
+        // Bundled extensions legitimately persist their own state (hello-loom does),
+        // so "clean" means no probe namespaces and no grants, not an empty root.
+        const remaining = await cdp.evaluate(`const root = window.SillyTavern.getContext().extensionSettings.__loom ?? {};
+            return {
+                grants: root.grants ?? [],
+                stateKeys: Object.keys(root.state ?? {}),
+                installed: root.state?.['loom-ui']?.installedExtensions ?? [],
+            };`);
+        const probeState = remaining.stateKeys.filter(key => /^verify-/.test(key));
+        if (remaining.grants.length > 0 || probeState.length > 0 || remaining.installed.length > 0) {
+            record('cleanup removed the test grants', false, JSON.stringify(remaining));
+        } else {
+            record('cleanup removed the test grants', true, `bundled state kept: ${remaining.stateKeys.join(', ') || 'none'}`);
+        }
         record('cleanup removed the scratch world book', (await scratchBookExists(cdp)) === false);
     } catch (error) {
         record('cleanup removed the test grants', false, error.message);
@@ -1432,6 +1498,7 @@ async function main() {
         await runProbe('world write', probeWorldWrite, cdp);
         await runProbe('world export/import', probeWorldExportImport, cdp);
         await runProbe('world rename', probeWorldRename, cdp);
+        await runProbe('extension install', probeExtensionInstall, cdp);
         await runProbe('character write', probeCharacterWrite, cdp);
         await runProbe('chat mutation', probeChatMutation, cdp);
         await runProbe('reload restore', probeReloadRestore, cdp);

@@ -43,6 +43,27 @@ function validatePermissionList(list) {
 }
 
 /**
+ * Merge a code-exported manifest with one supplied by the caller (usually parsed
+ * from a package's `manifest.json`). The explicit manifest wins field by field,
+ * but `activate`/`deactivate` are only defined in code, so they are kept when the
+ * explicit manifest has none.
+ */
+function mergeManifests(moduleManifest, explicitManifest) {
+    if (!moduleManifest && !explicitManifest) return null;
+    if (!moduleManifest) return explicitManifest;
+
+    const merged = { ...moduleManifest };
+    if (explicitManifest && typeof explicitManifest === 'object') {
+        for (const [key, value] of Object.entries(explicitManifest)) {
+            if (value !== undefined) merged[key] = value;
+        }
+        merged.activate = explicitManifest.activate ?? moduleManifest.activate;
+        merged.deactivate = explicitManifest.deactivate ?? moduleManifest.deactivate;
+    }
+    return merged;
+}
+
+/**
  * @param {object} core The Core functions this loader drives.
  * @returns {object} loader API, spread into `globalThis.Loom`.
  */
@@ -382,20 +403,23 @@ export function createExtensionLoader(core) {
             };
         }
 
-        let manifest = options.manifest;
-        if (manifest === undefined) {
-            try {
-                const candidate = typeof module.default === 'function' ? await module.default() : module.default;
-                manifest = candidate ?? module.manifest;
-            } catch (error) {
-                return {
-                    id: null,
-                    specifier,
-                    state: 'failed',
-                    error: { code: 'MANIFEST_FAILED', message: error instanceof Error ? error.message : String(error) },
-                };
-            }
+        let moduleManifest = null;
+        try {
+            const candidate = typeof module.default === 'function' ? await module.default() : module.default;
+            moduleManifest = candidate ?? module.manifest ?? null;
+        } catch (error) {
+            return {
+                id: null,
+                specifier,
+                state: 'failed',
+                error: { code: 'MANIFEST_FAILED', message: error instanceof Error ? error.message : String(error) },
+            };
         }
+
+        // A package ships identity/dependencies/permissions in `manifest.json`
+        // while the hooks (`activate`/`deactivate`) can only live in code. Merge
+        // both, with the module's hooks kept when the JSON manifest omits them.
+        const manifest = mergeManifests(moduleManifest, options.manifest);
         if (!manifest || typeof manifest !== 'object') {
             return {
                 id: null,

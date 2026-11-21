@@ -167,6 +167,20 @@ Whole-book lifecycle (destructive, hence a separate permission):
 
 All host capabilities return mapped primitives rather than host objects. When SillyTavern is unavailable (for example outside the browser), calls fail with a structured host-unavailable error.
 
+## Extension Packages and Installation
+
+A Loom extension package is a directory `extensions/<id>/` with `manifest.json` (`id`/`name`/`version`/`entry`, optional `dependencies`/`permissions`) and the entry module. `npm run extensions:index` writes the deterministic `extensions/index.json` that the browser reads.
+
+`globalThis.LoomUI` exposes installation:
+
+- `installExtension(url)` → resolves `url` against Loom's root (or accepts an absolute URL), imports the module through Core's `importExtension`, remembers `{ id, entry }` in `loom-ui`'s persisted state, and returns the entry URL. A failed import rejects with the Core message and leaves no record.
+- `uninstallExtension(idOrEntry)` → unloads the extension (if registered) and forgets the record.
+- `getInstalledExtensions()` → `[{ id, entry, bundled, state, name, error }]` for bundled and manually installed packages, with the runtime state or `missing` when nothing is registered.
+
+`importExtension(entryUrl, options)` merges `options.manifest` (a package's `manifest.json`) with the module's exported manifest: the explicit manifest wins field by field, but `activate`/`deactivate` come from code when the JSON manifest has none. A package therefore keeps identity in JSON and behaviour in code.
+
+Bundled packages load on every boot; a missing `extensions/index.json` is not an error. Manually installed URLs are re-imported on the next boot; a failed import is shown in the panel with its error and keeps its record until removed.
+
 ## Built-in Host Events (`loom-host`)
 
 The adapter forwards an allowlist of SillyTavern events as Loom events, with payload `{ source: 'sillytavern', event: <HOST_EVENT_KEY> }`. Raw host arguments are intentionally not forwarded.

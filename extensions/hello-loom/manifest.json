@@ -1,0 +1,9 @@
+{
+    "id": "hello-loom",
+    "name": "Hello Loom",
+    "version": "0.1.0",
+    "description": "Loom 的示例扩展：注册一个问候能力，并把调用次数持久化。",
+    "entry": "index.js",
+    "dependencies": [],
+    "permissions": []
+}

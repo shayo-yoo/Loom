@@ -371,6 +371,31 @@ test('imports an extension module and activates it', async () => {
     delete globalThis.__loomImportedActivated;
 });
 
+test('merges a package manifest.json with the module hooks', async () => {
+    // A package ships identity in manifest.json and hooks in code; both must land
+    // in the same registration.
+    const result = await importExtension(
+        `data:text/javascript,${encodeURIComponent(`export default { activate: () => { globalThis.__loomPackageHook = true; } };`)}`,
+        { manifest: { id: ids.plain, name: 'Packaged', version: '3.0.0', dependencies: [] } },
+    );
+
+    assert.equal(result.state, 'active', 'the package activates with its JSON identity');
+    assert.equal(globalThis.__loomPackageHook, true, 'the code hook runs');
+    const state = getExtensionState(ids.plain);
+    assert.equal(state.name, 'Packaged');
+    assert.equal(state.version, '3.0.0');
+    delete globalThis.__loomPackageHook;
+});
+
+test('a package manifest cannot drop the module activate hook', async () => {
+    const result = await importExtension(
+        `data:text/javascript,${encodeURIComponent('export default { activate: () => {} };')}`,
+        { manifest: { id: ids.dependent, name: 'No hook override' } },
+    );
+    assert.equal(result.state, 'active');
+    assert.deepEqual(result.error, null);
+});
+
 test('imports a manifest exported as a function or via options', async () => {
     const asFunction = await importExtension(
         `data:text/javascript,${encodeURIComponent(`export default () => ({ id: '${ids.base}', name: 'From factory' });`)}`,
