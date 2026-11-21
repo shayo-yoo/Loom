@@ -22,20 +22,21 @@
 
 import { spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 const DEFAULT_CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const CHROME_PATH = process.env.LOOM_CHROME || DEFAULT_CHROME;
 const ST_URL = process.env.LOOM_ST_URL || 'http://127.0.0.1:8100/';
-const CDP_PORT = Number(process.env.LOOM_CDP_PORT || 9333);
+const CDP_PORT = Number(process.env.LOOM_CDP_PORT ?? 0);
 const READY_TIMEOUT_MS = 30_000;
 const SETTLE_TIMEOUT_MS = 20_000;
 
 const results = [];
 const consoleErrors = [];
 let expectedVersion = null;
+let cdpPort = CDP_PORT;
 
 function record(name, ok, detail = '') {
     results.push({ name, ok, detail });
@@ -122,19 +123,34 @@ class Cdp {
 
     /**
      * Evaluate an expression in the page and return its JSON value. Async
-     * expressions are awaited, so `await` inside the expression works.
+     * expressions are awaited, so `await` inside the expression works. A
+     * timeout keeps a wedged page call (e.g. an awaited host dialog) from
+     * hanging the whole run.
      */
-    async evaluate(expression) {
-        const response = await this.send('Runtime.evaluate', {
+    async evaluate(expression, timeoutMs = 0) {
+        const evaluation = this.send('Runtime.evaluate', {
             expression: `(async () => { ${expression} })()`,
             awaitPromise: true,
             returnByValue: true,
+        }).then(response => {
+            if (response.exceptionDetails) {
+                const detail = response.exceptionDetails.exception?.description ?? response.exceptionDetails.text;
+                throw new Error(`Page evaluation failed: ${detail}`);
+            }
+            return response.result.value;
         });
-        if (response.exceptionDetails) {
-            const detail = response.exceptionDetails.exception?.description ?? response.exceptionDetails.text;
-            throw new Error(`Page evaluation failed: ${detail}`);
+        if (timeoutMs === 0) {
+            return evaluation;
         }
-        return response.result.value;
+        let timer = null;
+        const timeout = new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`Page evaluation timed out after ${timeoutMs}ms`)), timeoutMs);
+        });
+        try {
+            return await Promise.race([evaluation, timeout]);
+        } finally {
+            clearTimeout(timer);
+        }
     }
 
     /** Poll an expression until it returns a truthy value. */
@@ -163,17 +179,32 @@ async function launchChrome(profileDir) {
         '--disable-extensions',
         '--window-size=1280,900',
         `--user-data-dir=${profileDir}`,
+        // Port 0 lets Chrome pick a free port and write it to DevToolsActivePort:
+        // the host reserves dynamic port ranges, so a fixed port can be unbindable.
         `--remote-debugging-port=${CDP_PORT}`,
         'about:blank',
     ];
     const child = spawn(CHROME_PATH, args, { stdio: 'ignore', windowsHide: true });
-    await waitForHttp(`http://127.0.0.1:${CDP_PORT}/json/version`, READY_TIMEOUT_MS);
+    cdpPort = CDP_PORT === 0 ? await readDevToolsPort(profileDir) : CDP_PORT;
+    await waitForHttp(`http://127.0.0.1:${cdpPort}/json/version`, READY_TIMEOUT_MS);
     return child;
+}
+
+async function readDevToolsPort(profileDir) {
+    const file = path.join(profileDir, 'DevToolsActivePort');
+    for (let attempt = 0; attempt < 150; attempt += 1) {
+        if (existsSync(file)) {
+            const [port] = readFileSync(file, 'utf8').trim().split('\n');
+            if (port) return Number(port);
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    throw new Error(`Chrome did not write ${file}`);
 }
 
 async function openPageTarget() {
     // Reuse the initial about:blank target; create one if the browser started without it.
-    const targets = await (await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`)).json();
+    const targets = await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`)).json();
     const page = targets.find(target => target.type === 'page');
     if (page) return page;
     const created = await (await fetch(`http://127.0.0.1:${CDP_PORT}/json/new?about:blank`, { method: 'PUT' })).json();
@@ -399,6 +430,7 @@ async function probeConsent(cdp) {
 
 const SCRATCH_CHAR = '__loom_verify_char__';
 const SCRATCH_BOOK = '__loom_verify_scratch__';
+const SCRATCH_CHAT_CHAR = '__loom_verify_chat__';
 const CHARACTERS_DIR = path.join('D:\\1\\APP\\SillyTavern', 'data', 'default-user', 'characters');
 
 /**
@@ -951,6 +983,126 @@ async function probeChatWrite(cdp) {
     }
 }
 
+async function probeChatMutation(cdp) {
+    // Edits and deletes are destructive, so they run on a scratch character's own
+    // chat: create the card, select it, edit its greeting, check the chat file on
+    // disk, delete the greeting, and remove the scratch card (with its chat)
+    // afterwards. The user's chats are never opened.
+    let created = null;
+    let chatsDir = null;
+    try {
+        created = await cdp.evaluate(`const context = window.SillyTavern.getContext();
+            const response = await fetch('/api/characters/create', {
+                method: 'POST',
+                headers: context.getRequestHeaders(),
+                body: JSON.stringify({
+                    ch_name: ${JSON.stringify(SCRATCH_CHAT_CHAR)},
+                    file_name: ${JSON.stringify(SCRATCH_CHAT_CHAR)},
+                    description: 'scratch',
+                    first_mes: 'hello from scratch',
+                }),
+            });
+            return { ok: response.ok, avatar: response.ok ? await response.text() : null };`, 20_000);
+        if (created.ok !== true) {
+            record('chat mutation real path', true, 'not exercised: scratch character could not be created');
+            return;
+        }
+
+        const selected = await cdp.evaluate(`const context = window.SillyTavern.getContext();
+            await context.getCharacters();
+            const index = (context.characters ?? []).findIndex(item => item.avatar === ${JSON.stringify(created.avatar)});
+            if (index < 0) return { selected: false };
+            await context.selectCharacterById(index);
+            await new Promise(resolve => setTimeout(resolve, 500));
+            return {
+                selected: true,
+                length: context.chat.length,
+                greeting: String(context.chat[0]?.mes ?? ''),
+                chatId: context.getCurrentChatId?.() ?? null,
+            };`, 20_000);
+        assertThat('the scratch chat is open before mutating it',
+            selected.selected === true && selected.length === 1, JSON.stringify(selected));
+        if (selected.selected !== true) return;
+
+        chatsDir = path.join(path.dirname(CHARACTERS_DIR), 'chats', SCRATCH_CHAT_CHAR);
+
+        const mutated = await cdp.evaluate(`const Loom = window.Loom;
+            const context = window.SillyTavern.getContext();
+            const edited = await Loom.executeCapability('loom-host', 'chat.edit',
+                { index: 0, text: 'edited greeting' }, { caller: 'verify-probe' });
+            const afterEdit = String(context.chat[0]?.mes ?? '');
+            const outOfRange = await Loom.executeCapability('loom-host', 'chat.edit',
+                { index: 9, text: 'nope' }, { caller: 'verify-probe' });
+            const refused = await Loom.executeCapability('loom-host', 'chat.delete',
+                { index: 0, expect: 'stale text' }, { caller: 'verify-probe' });
+            const deleted = await Loom.executeCapability('loom-host', 'chat.delete',
+                { index: 0, expect: 'edited greeting' }, { caller: 'verify-probe' });
+            return { edited, afterEdit, outOfRange, refused, deleted, lengthAfter: context.chat.length };`, 30_000);
+        assertThat('chat.edit rewrites the message text',
+            mutated.edited.success === true && mutated.afterEdit === 'edited greeting',
+            JSON.stringify({ edited: mutated.edited, afterEdit: mutated.afterEdit }));
+        assertThat('chat.edit reports an out-of-range index',
+            mutated.outOfRange.success === false && mutated.outOfRange.error?.code === 'MESSAGE_NOT_FOUND',
+            JSON.stringify(mutated.outOfRange));
+        assertThat('chat.delete refuses a stale expect',
+            mutated.refused?.success === false && mutated.refused.error?.code === 'CONFIRMATION_REQUIRED',
+            JSON.stringify(mutated.refused));
+        assertThat('chat.delete removes the message again',
+            mutated.deleted?.success === true && mutated.deleted.data.removed === 1
+            && mutated.lengthAfter === 0,
+            JSON.stringify({ deleted: mutated.deleted, after: mutated.lengthAfter }));
+
+        // The on-disk chat file is the proof the edit was persisted, not just
+        // rendered. Deletion saves through a debounced writer, so both checks
+        // poll the file briefly.
+        const chatFile = readChatFile(chatsDir, selected.chatId);
+        const editedOnDisk = chatFile !== null && await waitForFile(chatFile, text => text.includes('edited greeting'), 5_000);
+        assertThat('the edit was persisted to the scratch chat file', editedOnDisk,
+            `file=${chatFile ?? 'not found'}`);
+        const deletedOnDisk = chatFile !== null && await waitForFile(chatFile, text => !text.includes('edited greeting'), 5_000);
+        assertThat('the deleted message is gone from the chat file', deletedOnDisk,
+            `file=${chatFile ?? 'not found'}`);
+    } finally {
+        if (created?.ok === true) {
+            try {
+                await cdp.evaluate(`const context = window.SillyTavern.getContext();
+                    await fetch('/api/characters/delete', {
+                        method: 'POST',
+                        headers: context.getRequestHeaders(),
+                        body: JSON.stringify({ avatar_url: ${JSON.stringify(created.avatar)}, delete_chats: true }),
+                    });
+                    return true;`, 20_000);
+            } catch (error) {
+                record('scratch chat cleanup request', false, error.message);
+            }
+            assertThat('the scratch chat card is gone',
+                existsSync(path.join(CHARACTERS_DIR, created.avatar)) === false);
+        }
+    }
+}
+
+/** Newest JSONL chat file for a character, plus the expected chat-id match. */
+function readChatFile(directory, chatId) {
+    if (!existsSync(directory)) return null;
+    const files = readdirSync(directory).filter(name => name.endsWith('.jsonl'));
+    if (files.length === 0) return null;
+    if (chatId) {
+        const named = files.find(name => name.includes(chatId));
+        if (named) return path.join(directory, named);
+    }
+    return path.join(directory, files[0]);
+}
+
+/** Poll a file until `predicate` holds for its contents. */
+async function waitForFile(file, predicate, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (existsSync(file) && predicate(readFileSync(file, 'utf8'))) return true;
+        await sleep(100);
+    }
+    return false;
+}
+
 async function probeCharacterWrite(cdp) {
     const cardPath = path.join(CHARACTERS_DIR, `${SCRATCH_CHAR}.png`);
     let created = null;
@@ -1261,6 +1413,7 @@ async function main() {
         await runProbe('world export/import', probeWorldExportImport, cdp);
         await runProbe('world rename', probeWorldRename, cdp);
         await runProbe('character write', probeCharacterWrite, cdp);
+        await runProbe('chat mutation', probeChatMutation, cdp);
         await runProbe('reload restore', probeReloadRestore, cdp);
 
         const loomErrors = consoleErrors.filter(message => /loom/i.test(message));

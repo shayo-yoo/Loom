@@ -1,7 +1,7 @@
 import '../Loom%20Core/index.js';
 
 const EXTENSION_ID = 'loom-host';
-const HOST_VERSION = '0.22.0';
+const HOST_VERSION = '0.24.0';
 const runtime = globalThis.Loom;
 
 const nullInput = { type: 'null' };
@@ -1540,6 +1540,148 @@ const chatAppendCapability = {
     },
 };
 
+/**
+ * Existing-message mutation.
+ *
+ * Editing and deleting go through SillyTavern's own functions rather than
+ * splicing `context.chat` directly: `updateMessageBlock` keeps the rendered
+ * element in step with the data, and `deleteMessage` performs the bookkeeping
+ * (swipe/tool-call cascade, prompt-item cleanup, debounced save) that a raw
+ * splice would skip. Both are destructive, so:
+ * - `chat.edit` reports the previous text, which is what an undo needs;
+ * - `chat.delete` requires the caller to echo the current text in `expect`, so a
+ *   stale index cannot silently destroy an unrelated message.
+ */
+const chatEditCapability = {
+    id: 'chat.edit',
+    name: '编辑聊天消息',
+    description: '按索引修改已有消息文本并保存；需要 host.chat.write 授权。返回原文以便撤销。',
+    permissions: ['host.chat.write'],
+    input: {
+        type: 'object',
+        required: ['index', 'text'],
+        properties: {
+            index: { type: 'integer', minimum: 0 },
+            text: { type: 'string', minLength: 1, maxLength: CHAT_TEXT_LIMIT },
+        },
+        additionalProperties: false,
+    },
+    output: {
+        type: 'object',
+        required: ['index', 'previous', 'saved', 'rendered'],
+        properties: {
+            index: { type: 'integer', minimum: 0 },
+            previous: { type: 'string' },
+            saved: { type: 'boolean' },
+            rendered: { type: 'boolean' },
+        },
+        additionalProperties: false,
+    },
+    execute: async (input) => {
+        const context = getHostContext();
+        const chat = context.chat;
+        if (!Array.isArray(chat) || chat.length === 0) {
+            throw typedError('NO_CHAT', 'No chat is open; open a chat before editing a message.');
+        }
+        if (input.index >= chat.length) {
+            throw typedError('MESSAGE_NOT_FOUND', `Message index out of range: ${input.index}`, {
+                index: input.index,
+                length: chat.length,
+            });
+        }
+
+        const message = chat[input.index];
+        const previous = String(message.mes ?? '');
+        context.chat[input.index] = { ...message, mes: input.text };
+
+        let rendered = false;
+        if (typeof context.updateMessageBlock === 'function') {
+            try {
+                await context.updateMessageBlock(input.index, context.chat[input.index]);
+                rendered = true;
+            } catch (error) {
+                context.chat[input.index] = message;
+                throw typedError('MESSAGE_UPDATE_FAILED', `The host could not re-render message ${input.index}: ${error instanceof Error ? error.message : String(error)}`, {
+                    index: input.index,
+                });
+            }
+        }
+
+        let saved = false;
+        if (typeof context.saveChat === 'function') {
+            try {
+                await context.saveChat();
+                saved = true;
+            } catch {
+                saved = false;
+            }
+        }
+        return { index: input.index, previous, saved, rendered };
+    },
+};
+
+const chatDeleteCapability = {
+    id: 'chat.delete',
+    name: '删除聊天消息',
+    description: '按索引删除一条消息（破坏性）；必须在 expect 中回写当前消息原文；需要 host.chat.write 授权。',
+    permissions: ['host.chat.write'],
+    input: {
+        type: 'object',
+        required: ['index', 'expect'],
+        properties: {
+            index: { type: 'integer', minimum: 0 },
+            expect: { type: 'string', minLength: 1, maxLength: CHAT_TEXT_LIMIT },
+        },
+        additionalProperties: false,
+    },
+    output: {
+        type: 'object',
+        required: ['index', 'removed', 'remaining'],
+        properties: {
+            index: { type: 'integer', minimum: 0 },
+            removed: { type: 'integer', minimum: 0 },
+            remaining: { type: 'integer', minimum: 0 },
+        },
+        additionalProperties: false,
+    },
+    execute: async (input) => {
+        const context = getHostContext();
+        const chat = context.chat;
+        if (!Array.isArray(chat) || chat.length === 0) {
+            throw typedError('NO_CHAT', 'No chat is open; open a chat before deleting a message.');
+        }
+        if (input.index >= chat.length) {
+            throw typedError('MESSAGE_NOT_FOUND', `Message index out of range: ${input.index}`, {
+                index: input.index,
+                length: chat.length,
+            });
+        }
+        const current = String(chat[input.index].mes ?? '');
+        if (current !== input.expect) {
+            throw typedError('CONFIRMATION_REQUIRED', 'Deleting a message requires expect to repeat its current text exactly.', {
+                index: input.index,
+                current: current.slice(0, 200),
+            });
+        }
+        if (typeof context.deleteMessage !== 'function') {
+            throw typedError('HOST_UNSUPPORTED', 'This SillyTavern version does not expose deleteMessage().');
+        }
+
+        const before = chat.length;
+        // `askConfirmation` stays false: consent is Loom's permission gate plus the
+        // `expect` echo, and the host dialog cannot be driven from here.
+        await context.deleteMessage(input.index, undefined, false, true);
+        const remaining = Array.isArray(context.chat) ? context.chat.length : chat.length;
+        const removed = Math.max(0, before - remaining);
+        if (removed === 0) {
+            throw typedError('MESSAGE_DELETE_FAILED', `The host did not remove message ${input.index}.`, {
+                index: input.index,
+            });
+        }
+        return { index: input.index, removed, remaining };
+    },
+};
+
 const CAPABILITIES = Object.freeze([
     snapshotCapability,
     charactersCapability,
@@ -1558,6 +1700,8 @@ const CAPABILITIES = Object.freeze([
     viewportCapability,
     chatMessagesCapability,
     chatAppendCapability,
+    chatEditCapability,
+    chatDeleteCapability,
     settingsGetCapability,
     settingsSetCapability,
     settingsRemoveCapability,

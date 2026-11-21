@@ -1,5 +1,7 @@
 # Change Log
 
+- [CHG-20261121-026](history/recent/CHG-20261121-026.md): Message edit/delete — `chat.edit`/`chat.delete` with `expect` echo, undo token, and host-side cascade (0.24.0).
+- [CHG-20261121-025](history/recent/CHG-20261121-025.md): Character card write — `characters.update` through the host's `merge-attributes`, field-scoped writes (0.23.0).
 - [CHG-20261121-024](history/recent/CHG-20261121-024.md): World-book data movement — `worlds.export`/`import`/`rename`, binding migration, and the host-cache write fix (0.22.0).
 - [CHG-20261121-023](history/recent/CHG-20261121-023.md): Whole world-book lifecycle — `worlds.create`/`worlds.remove` behind `host.worldinfo.manage` with a name-echo confirmation (0.21.0).
 - [CHG-20261121-022](history/recent/CHG-20261121-022.md): Host message write — `chat.append` system messages gated by `host.chat.write`, with mandatory rollback (0.20.0).

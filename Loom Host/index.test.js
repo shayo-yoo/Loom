@@ -111,6 +111,8 @@ test('registers the host adapter and its capabilities', () => {
             'characters.list',
             'characters.update',
             'chat.append',
+            'chat.delete',
+            'chat.edit',
             'chat.messages',
             'context.snapshot',
             'settings.get',
@@ -1039,6 +1041,7 @@ test('fails settings calls with a structured error when the host settings are un
 function stubChatHost(options = {}) {
     const chat = options.chat ?? [];
     const appended = [];
+    const calls = [];
     let saved = 0;
     stubHost({
         // An explicit null chatId must survive the default (?? would replace it).
@@ -1052,9 +1055,21 @@ function stubChatHost(options = {}) {
             }
             chat.push({ name: 'System', is_system: true, is_user: false, mes: text, extra: { type } });
         },
-        saveChat: async () => { saved += 1; },
+        updateMessageBlock: async index => {
+            calls.push(['updateMessageBlock', index]);
+            if (options.failRender) throw new Error('render failed');
+        },
+        deleteMessage: async (index, swipeIndex, ask, deleteToolCalls) => {
+            calls.push(['deleteMessage', index, swipeIndex, ask, deleteToolCalls]);
+            if (options.noDelete) return;
+            chat.splice(index, 1);
+        },
+        saveChat: async () => {
+            saved += 1;
+            if (options.failSave) throw new Error('save failed');
+        },
     });
-    return { chat, appended, saved: () => saved };
+    return { chat, appended, calls, saved: () => saved };
 }
 
 test('appends a system message to the chat and saves it', async () => {
@@ -1087,6 +1102,91 @@ test('chat.append refuses to write without an open chat', async () => {
 
     const result = await executeCapability(EXTENSION_ID, 'chat.append', { text: 'x' }, { caller: consumerId });
     assert.equal(result.error.code, 'NO_CHAT');
+});
+
+test('chat.edit rewrites a message and reports the previous text', async () => {
+    const host = stubChatHost({ chat: [{ name: 'A', mes: 'old' }, { name: 'B', mes: 'second' }] });
+    registerConsumer();
+    grantPermission(consumerId, 'host.chat.write');
+
+    const result = await executeCapability(EXTENSION_ID, 'chat.edit',
+        { index: 0, text: 'edited' }, { caller: consumerId });
+    assert.deepEqual(result.data, { index: 0, previous: 'old', saved: true, rendered: true });
+    assert.equal(host.chat[0].mes, 'edited');
+    assert.deepEqual(host.calls, [['updateMessageBlock', 0]], 'the message is re-rendered');
+    assert.equal(host.saved(), 1, 'the edit is persisted');
+});
+
+test('chat.edit rolls the message back when the host cannot re-render', async () => {
+    const host = stubChatHost({ chat: [{ name: 'A', mes: 'old' }], failRender: true });
+    registerConsumer();
+    grantPermission(consumerId, 'host.chat.write');
+
+    const result = await executeCapability(EXTENSION_ID, 'chat.edit',
+        { index: 0, text: 'edited' }, { caller: consumerId });
+    assert.equal(result.error.code, 'MESSAGE_UPDATE_FAILED');
+    assert.equal(host.chat[0].mes, 'old', 'the text is restored');
+    assert.equal(host.saved(), 0, 'nothing is saved');
+});
+
+test('chat.edit reports a stale save and an out-of-range index', async () => {
+    const host = stubChatHost({ chat: [{ name: 'A', mes: 'old' }], failSave: true });
+    registerConsumer();
+    grantPermission(consumerId, 'host.chat.write');
+
+    const stale = await executeCapability(EXTENSION_ID, 'chat.edit',
+        { index: 0, text: 'edited' }, { caller: consumerId });
+    assert.equal(stale.data.saved, false, 'a failed save is not reported as saved');
+    assert.equal(stale.data.rendered, true);
+
+    const outOfRange = await executeCapability(EXTENSION_ID, 'chat.edit',
+        { index: 9, text: 'edited' }, { caller: consumerId });
+    assert.equal(outOfRange.error.code, 'MESSAGE_NOT_FOUND');
+});
+
+test('chat.delete requires the current text before removing a message', async () => {
+    const host = stubChatHost({ chat: [{ name: 'A', mes: 'old' }, { name: 'B', mes: 'second' }] });
+    registerConsumer();
+    grantPermission(consumerId, 'host.chat.write');
+
+    const guarded = await executeCapability(EXTENSION_ID, 'chat.delete',
+        { index: 0, expect: 'wrong text' }, { caller: consumerId });
+    assert.equal(guarded.error.code, 'CONFIRMATION_REQUIRED');
+    assert.deepEqual(guarded.error.details, { index: 0, current: 'old' });
+    assert.equal(host.chat.length, 2, 'nothing is deleted');
+    assert.deepEqual(host.calls, []);
+
+    const deleted = await executeCapability(EXTENSION_ID, 'chat.delete',
+        { index: 0, expect: 'old' }, { caller: consumerId });
+    assert.deepEqual(deleted.data, { index: 0, removed: 1, remaining: 1 });
+    assert.deepEqual(host.calls, [['deleteMessage', 0, undefined, false, true]],
+        'the host delete runs without its own confirmation dialog');
+});
+
+test('chat.delete reports when the host removed nothing', async () => {
+    const host = stubChatHost({ chat: [{ name: 'A', mes: 'old' }], noDelete: true });
+    registerConsumer();
+    grantPermission(consumerId, 'host.chat.write');
+
+    const result = await executeCapability(EXTENSION_ID, 'chat.delete',
+        { index: 0, expect: 'old' }, { caller: consumerId });
+    assert.equal(result.error.code, 'MESSAGE_DELETE_FAILED');
+});
+
+test('chat edit and delete are gated by host.chat.write', async () => {
+    const host = stubChatHost({ chat: [{ name: 'A', mes: 'old' }] });
+    registerConsumer();
+
+    for (const [id, input] of [
+        ['chat.edit', { index: 0, text: 'edited' }],
+        ['chat.delete', { index: 0, expect: 'old' }],
+    ]) {
+        const denied = await executeCapability(EXTENSION_ID, id, input, { caller: consumerId });
+        assert.equal(denied.error.code, 'PERMISSION_DENIED', id);
+        assert.deepEqual(denied.error.details.missing, ['host.chat.write'], id);
+    }
+    assert.deepEqual(host.calls, [], 'no host mutation happens without the grant');
+    assert.equal(host.chat[0].mes, 'old');
 });
 
 test('chat.append rejects unknown message types and oversized text', async () => {

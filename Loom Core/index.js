@@ -3,7 +3,7 @@ import { createExtensionLoader } from './loader.js';
 const EXTENSION_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/i;
 const PERMISSION_PATTERN = /^[a-z0-9][a-z0-9._:-]*$/i;
 const EVENT_NAME_PATTERN = /^[a-z0-9][a-z0-9:._-]*$/i;
-const LOOM_VERSION = '0.22.0';
+const LOOM_VERSION = '0.24.0';
 const capabilityRegistry = new Map();
 const extensionRegistry = new Map();
 const eventListeners = new Map();

@@ -97,6 +97,8 @@ Write capabilities (the read/write split required by Core requirements §5):
 | `worlds.entry.create` | `{ name, entry? }` | `{ name, uid, created }` | `host.worldinfo.write` |
 | `worlds.entry.remove` | `{ name, uid }` | `{ name, uid, removed }` | `host.worldinfo.write` |
 | `chat.append` | `{ text, type? }` | `{ appended, type, index }` | `host.chat.write` |
+| `chat.edit` | `{ index, text }` | `{ index, previous, saved, rendered }` | `host.chat.write` |
+| `chat.delete` | `{ index, expect }` | `{ index, removed, remaining }` | `host.chat.write` |
 | `worlds.create` | `{ name }` | `{ name, created }` | `host.worldinfo.manage` |
 | `worlds.remove` | `{ name, confirm }` | `{ name, removed }` | `host.worldinfo.manage` |
 | `worlds.export` | `{ name }` | `{ name, entries, data }` | — |
@@ -123,7 +125,30 @@ Whole-book lifecycle (destructive, hence a separate permission):
 - A chat must be open: no chat id and an empty chat buffers to `NO_CHAT` instead of writing nowhere.
 - `sendSystemMessage` renders but does not save, so the handler calls `saveChat?.()` afterwards; a message that is not persisted would silently disappear on the next reload.
 - **Rollback is mandatory.** SillyTavern pushes the message *before* rendering it, so a render failure (or an unsupported type on some builds) can leave a half-written entry. The handler catches the throw, pops everything it added, and reports `HOST_UNSUPPORTED`. A failed append never mutates the chat.
-- Known host hazard: when the current chat already contains a malformed entry, SillyTavern's own rendering path can throw `Cannot read properties of undefined (reading 'is_user')`. That is recorded rather than worked around — the capability reports it and leaves the chat untouched.
+- Known host hazard: when the current chat already contains a malformed entry, SillyTavern's own rendering path can throw `Cannot read properties of undefined (reading 'is_user')`. That is recorded rather than worked around — the capability reports it and leaves the chat untouched. The same error appears in an environment without a selected persona (system messages name the character), which is why the browser harness verifies edit/delete independently of append.
+
+`chat.edit` changes an existing message's text:
+
+- The message is mutated in `context.chat`, then re-rendered through the host's `updateMessageBlock(index, message)`; without the re-render the DOM would keep showing the old text while the data changed.
+- `previous` is returned **before** the write, which is the undo token: restoring is a second `chat.edit` with the old text.
+- **Rollback:** if re-rendering throws, the pre-write message object is put back and the call fails with `MESSAGE_UPDATE_FAILED`. A failed edit never leaves a half-written message.
+- `saved`/`rendered` report the outcomes. A host whose `saveChat` rejects leaves the text in memory with `saved: false`, so the caller can see a reload would lose the edit; a host without `updateMessageBlock` still writes and reports `rendered: false`.
+- Out-of-range index is `MESSAGE_NOT_FOUND` with `details.length`; no open chat is `NO_CHAT`.
+
+`chat.delete` removes a message:
+
+- **`expect` must repeat the current text exactly** (`CONFIRMATION_REQUIRED`, `details.current`). Index-based deletion is irreversible, so a stale index must not be able to destroy a different message.
+- Delegates to the host's `deleteMessage(index, undefined, false, true)`: swipe/tool-call cascade, prompt-item cleanup and the debounced save are SillyTavern's own bookkeeping, and a raw `chat.splice` would silently diverge from it. The host's confirmation dialog is suppressed (`askConfirmation: false`) because consent is Loom's permission gate plus the `expect` echo; a capability cannot drive that dialog.
+- `removed` is measured (`lengthBefore - lengthAfter`), not assumed — a cascade can remove more than one entry. A host that removes nothing fails with `MESSAGE_DELETE_FAILED`.
+- The browser harness proves the round trip on a scratch character's chat: edit → the chat file on disk contains the new text → delete → the file no longer does → the scratch card and its chat are removed. The user's chats are never opened.
+
+`characters.update` writes a character card:
+
+- `{ avatar, description?, firstMessage?, exampleMessages?, tags? }` → `{ avatar, name, updated, refreshed }`. The card is addressed by `avatar` (the PNG filename), SillyTavern's stable key for a card; `name` is display text.
+- **Only the fields that were sent are written**; `''` clears a field and an absent field is untouched. `updated` lists exactly the changed fields in a fixed order (`description`, `firstMessage`, `exampleMessages`, `tags`), so "wrote nothing" is distinguishable from "wrote an empty value". Tags are trimmed, de-duplicated and stripped of empties before writing.
+- The write goes through SillyTavern's own `/api/characters/merge-attributes` (the endpoint its editor uses) rather than a hand-rolled PNG rewrite: the endpoint deep-merges into the V2 `data` block, which the host normalises over the legacy top-level copy when reading. Writing the legacy copy too would create a second source of truth the host does not maintain — third-party tools that read V1 fields without `data` therefore see stale text (documented limitation, not a workaround).
+- The in-memory `context.characters` copy is refreshed through the host's `getCharacters()`; a card that still shows the old text after the write fails with `CHARACTER_UPDATE_FAILED` instead of reporting a silent success.
+- The browser harness writes a scratch card, parses the PNG's `chara` tEXt chunk to assert the V2 `data` block carries the edit, and deletes the scratch card afterwards.
 
 `worlds.entry.update` is the world-book write contract:
 
