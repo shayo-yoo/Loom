@@ -1290,6 +1290,100 @@ async function probeCharacterWrite(cdp) {
     }
 }
 
+const RENAME_CARD_SRC = '__loom_verify_rename_link_src__';
+const RENAME_CARD_DST = '__loom_verify_rename_link_dst__';
+const RENAME_CARD_AVATAR = '__loom_verify_rename_link_card__';
+
+async function probeRenameCardLinks(cdp) {
+    // A book bound to a card is migrated only on request, with the card-write
+    // grant: prove both the refusal by default and the real link rewrite.
+    let cardCreated = false;
+    try {
+        const setup = await cdp.evaluate(`const Loom = window.Loom;
+            if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) {
+                Loom.registerExtension({ id: 'verify-probe', name: 'Verify Probe' });
+            }
+            for (const permission of ['host.worldinfo.manage', 'host.characters.manage', 'host.characters.write']) {
+                if (!Loom.checkPermission('verify-probe', permission)) Loom.grantPermission('verify-probe', permission);
+            }
+            const book = await Loom.executeCapability('loom-host', 'worlds.create', { name: ${JSON.stringify(RENAME_CARD_SRC)} }, { caller: 'verify-probe' });
+            await Loom.executeCapability('loom-host', 'worlds.entry.create',
+                { name: ${JSON.stringify(RENAME_CARD_SRC)}, entry: { comment: 'link probe', content: 'linked content', keys: ['link'] } },
+                { caller: 'verify-probe' });
+            const card = await Loom.executeCapability('loom-host', 'characters.create',
+                { name: ${JSON.stringify(RENAME_CARD_AVATAR)} }, { caller: 'verify-probe' });
+            const context = window.SillyTavern.getContext();
+            const link = card.success
+                ? await fetch('/api/characters/merge-attributes', {
+                    method: 'POST',
+                    headers: context.getRequestHeaders(),
+                    body: JSON.stringify({ avatar: card.data.avatar, data: { extensions: { world: ${JSON.stringify(RENAME_CARD_SRC)} } } }),
+                })
+                : null;
+            await context.getCharacters();
+            return {
+                book: book.success,
+                card: card.success,
+                link: link ? link.ok : false,
+                avatar: card.success ? card.data.avatar : null,
+                bound: (context.characters ?? []).some(item => item.avatar === (card.data?.avatar) && item.data?.extensions?.world === ${JSON.stringify(RENAME_CARD_SRC)}),
+            };`);
+        assertThat('the linked scratch book and card are ready',
+            setup.book === true && setup.card === true && setup.link === true && setup.bound === true,
+            JSON.stringify(setup));
+        if (setup.card !== true) return;
+        cardCreated = true;
+
+        const refused = await cdp.evaluate(`return await window.Loom.executeCapability('loom-host', 'worlds.rename',
+            { name: ${JSON.stringify(RENAME_CARD_SRC)}, to: ${JSON.stringify(RENAME_CARD_DST)}, confirm: ${JSON.stringify(RENAME_CARD_SRC)} },
+            { caller: 'verify-probe' });`);
+        assertThat('a bound card blocks the rename by default',
+            refused.success === false && refused.error.code === 'WORLD_IN_USE'
+            && Array.isArray(refused.error.details.characters),
+            JSON.stringify(refused.error));
+
+        const migrated = await cdp.evaluate(`return await window.Loom.executeCapability('loom-host', 'worlds.rename',
+            { name: ${JSON.stringify(RENAME_CARD_SRC)}, to: ${JSON.stringify(RENAME_CARD_DST)}, confirm: ${JSON.stringify(RENAME_CARD_SRC)}, migrateCards: true },
+            { caller: 'verify-probe' });`);
+        assertThat('migrateCards rewrites the card link and renames the book',
+            migrated.success === true && migrated.data.migrated.includes('cards'),
+            JSON.stringify(migrated.data ?? migrated.error));
+
+        const state = await cdp.evaluate(`const context = window.SillyTavern.getContext();
+            await context.getCharacters();
+            const list = await window.Loom.executeCapability('loom-host', 'worlds.list', null, { caller: 'verify-probe' });
+            const card = (context.characters ?? []).find(item => item.avatar === ${JSON.stringify(setup.avatar)});
+            return {
+                cardWorld: card?.data?.extensions?.world ?? card?.world ?? null,
+                oldListed: list.data.includes(${JSON.stringify(RENAME_CARD_SRC)}),
+                newListed: list.data.includes(${JSON.stringify(RENAME_CARD_DST)}),
+            };`);
+        assertThat('the card now points at the new name',
+            state.cardWorld === RENAME_CARD_DST, JSON.stringify(state));
+        assertThat('the old book is gone and the new one listed',
+            state.oldListed === false && state.newListed === true, JSON.stringify(state));
+    } finally {
+        if (cardCreated) {
+            await cdp.evaluate(`const Loom = window.Loom;
+                const context = window.SillyTavern.getContext();
+                await fetch('/api/characters/delete', {
+                    method: 'POST',
+                    headers: context.getRequestHeaders(),
+                    body: JSON.stringify({ avatar_url: ${JSON.stringify(RENAME_CARD_AVATAR)} + '.png', delete_chats: false }),
+                });
+                await context.getCharacters();
+                for (const name of [${JSON.stringify(RENAME_CARD_SRC)}, ${JSON.stringify(RENAME_CARD_DST)}]) {
+                    if (Loom.listExtensions().length) {
+                        await Loom.executeCapability('loom-host', 'worlds.remove', { name, confirm: name }, { caller: 'verify-probe' });
+                    }
+                }
+                return true;`);
+            await rm(path.join('D:\\1\\APP\\SillyTavern', 'data', 'default-user', 'chats', RENAME_CARD_AVATAR),
+                { recursive: true, force: true });
+        }
+    }
+}
+
 async function probeExtensionInstall(cdp) {
     // Bundled discovery: hello-loom ships with Loom and must be indexed and active.
     const bundled = await cdp.evaluate(`const Loom = window.Loom;
@@ -1711,6 +1805,7 @@ async function main() {
         await runProbe('world write', probeWorldWrite, cdp);
         await runProbe('world export/import', probeWorldExportImport, cdp);
         await runProbe('world rename', probeWorldRename, cdp);
+        await runProbe('rename card links', probeRenameCardLinks, cdp);
         await runProbe('extension install', probeExtensionInstall, cdp);
         await runProbe('world-book manager', probeWorldBookManager, cdp);
         await runProbe('character write', probeCharacterWrite, cdp);

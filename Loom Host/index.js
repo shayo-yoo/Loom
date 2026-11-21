@@ -1,7 +1,7 @@
 import '../Loom%20Core/index.js';
 
 const EXTENSION_ID = 'loom-host';
-const HOST_VERSION = '0.28.0';
+const HOST_VERSION = '0.29.0';
 const runtime = globalThis.Loom;
 
 const nullInput = { type: 'null' };
@@ -431,18 +431,27 @@ const worldsImportCapability = {
  * migrated explicitly: the current chat's `world_info` binding, the persona
  * lorebook, and the global activation selection.
  */
+/**
+ * Cards that reference a world book, split by whether the reference is movable.
+ *
+ * `extensions.world` is a link: it can be rewritten through the host's merge
+ * endpoint (this is what SillyTavern's own rename does). A card's embedded
+ * `character_book.name` is a copy inside the card, not a link — renaming the
+ * world book does not rename it, so such a card still blocks the rename.
+ */
 function characterReferences(context, worldName) {
     const characters = Array.isArray(context.characters) ? context.characters : [];
-    const linked = [];
+    const bound = [];
+    const embedded = [];
     for (const character of characters) {
         const card = character?.data;
         const boundWorld = card?.extensions?.world ?? character?.world ?? null;
         const bookName = card?.character_book?.name ?? null;
-        if (boundWorld === worldName || bookName === worldName) {
-            linked.push(String(character?.name ?? character?.avatar ?? 'unknown'));
-        }
+        const name = String(character?.name ?? character?.avatar ?? 'unknown');
+        if (boundWorld === worldName) bound.push({ name, avatar: String(character?.avatar ?? '') });
+        else if (bookName === worldName) embedded.push(name);
     }
-    return linked;
+    return { bound, embedded };
 }
 
 function isWorldGloballySelected(worldName) {
@@ -463,6 +472,7 @@ const worldsRenameCapability = {
             name: { type: 'string', minLength: 1, maxLength: 128 },
             to: { type: 'string', minLength: 1, maxLength: 128 },
             confirm: { type: 'string', minLength: 1, maxLength: 128 },
+            migrateCards: { type: 'boolean' },
         },
         additionalProperties: false,
     },
@@ -476,7 +486,7 @@ const worldsRenameCapability = {
         },
         additionalProperties: false,
     },
-    execute: async (input) => {
+    execute: async (input, contextInfo) => {
         const context = getHostContext();
         if (typeof context.loadWorldInfo !== 'function') {
             throw typedError('HOST_UNSUPPORTED', 'This SillyTavern version does not expose world-book loading.');
@@ -498,11 +508,29 @@ const worldsRenameCapability = {
         }
 
         // Everything that could block the rename is checked before any write.
-        const linkedCharacters = characterReferences(context, from);
-        if (linkedCharacters.length > 0) {
-            throw typedError('WORLD_IN_USE', 'A character card is bound to this world book; renaming it would break that link.', {
-                characters: linkedCharacters,
+        const references = characterReferences(context, from);
+        // An embedded world book is a copy inside the card, not a link: renaming
+        // the world book cannot move it, so it always blocks.
+        if (references.embedded.length > 0) {
+            throw typedError('WORLD_IN_USE', 'A character card embeds a world book with this name; renaming the book would not rename the embedded copy.', {
+                embeddedBooks: references.embedded,
             });
+        }
+        const migrateCards = input.migrateCards === true;
+        if (references.bound.length > 0) {
+            if (!migrateCards) {
+                throw typedError('WORLD_IN_USE', 'A character card is bound to this world book; pass migrateCards: true to rewrite those links.', {
+                    characters: references.bound.map(character => character.name),
+                    hint: 'migrateCards',
+                });
+            }
+            // Rewriting cards is a card write, not a world-book write: it needs its
+            // own grant even though the rename itself is already authorised.
+            if (contextInfo?.hasPermission?.('host.characters.write') !== true) {
+                throw typedError('PERMISSION_DENIED', 'Migrating character-card links requires host.characters.write.', {
+                    missing: ['host.characters.write'],
+                });
+            }
         }
         // A globally activated book cannot be retargeted reliably: the host rebuilds
         // its activation dropdown without guaranteeing the renamed entry exists, so
@@ -527,11 +555,9 @@ const worldsRenameCapability = {
             throw typedError('WORLD_CREATE_FAILED', `The host did not register the renamed world book: ${to}`);
         }
 
-        await postWorldRequest(context, '/api/worldinfo/delete', { name: from });
-        await context.updateWorldInfoList?.();
-        if (getWorldNames(context).includes(from)) {
-            throw typedError('WORLD_REMOVE_FAILED', `The host still lists the old world book: ${from}`);
-        }
+        // Deletion is deliberately the last write: card links and chat bindings
+        // must be moved while the old book still exists, so a failure leaves every
+        // reference resolving to the old name.
 
         const metadata = context.chatMetadata;
         if (metadata && typeof metadata === 'object' && metadata.world_info === from) {
@@ -545,7 +571,48 @@ const worldsRenameCapability = {
             context.saveSettingsDebounced?.();
             migrated.push('persona');
         }
-        return { from, to, migrated };    },
+        // Card links are rewritten before the old book is deleted: a failure
+        // leaves the old book in place, so every card still resolves.
+        if (migrateCards && references.bound.length > 0) {
+            if (typeof globalThis.fetch !== 'function') {
+                throw typedError('HOST_UNSUPPORTED', 'This environment has no fetch() for card-link migration.');
+            }
+            const failed = [];
+            for (const character of references.bound) {
+                try {
+                    const response = await globalThis.fetch('/api/characters/merge-attributes', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', ...(context.getRequestHeaders?.() ?? {}) },
+                        body: JSON.stringify({ avatar: character.avatar, data: { extensions: { world: to } } }),
+                    });
+                    if (!response || response.ok === false) {
+                        throw new Error(`status ${response?.status ?? 'unknown'}`);
+                    }
+                    await context.getOneCharacter?.(character.avatar);
+                } catch (error) {
+                    failed.push({
+                        avatar: character.avatar,
+                        name: character.name,
+                        message: error instanceof Error ? error.message : String(error),
+                    });
+                }
+            }
+            if (failed.length > 0) {
+                throw typedError('CARD_LINK_MIGRATION_FAILED', 'Some character cards could not be re-pointed; the old world book was kept.', {
+                    failed,
+                    migrated: [...migrated],
+                });
+            }
+            migrated.push('cards');
+        }
+
+        await postWorldRequest(context, '/api/worldinfo/delete', { name: from });
+        await context.updateWorldInfoList?.();
+        if (getWorldNames(context).includes(from)) {
+            throw typedError('WORLD_REMOVE_FAILED', `The host still lists the old world book: ${from}`);
+        }
+        return { from, to, migrated };
+    },
 };
 
 const worldsCapability = {

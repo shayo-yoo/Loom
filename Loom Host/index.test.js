@@ -452,6 +452,15 @@ function stubRenameHost(options = {}) {
             if (index >= 0) names.splice(index, 1);
             return { ok: true, status: 200 };
         }
+        if (path === '/api/characters/merge-attributes') {
+            if (options.failCardWrite) return { ok: false, status: 500 };
+            for (const character of options.characters ?? []) {
+                if (character.avatar === body.avatar) {
+                    character.data = { ...(character.data ?? {}), extensions: { ...(character.data?.extensions ?? {}), ...(body.data?.extensions ?? {}) } };
+                }
+            }
+            return { ok: true, status: 200 };
+        }
         return { ok: false, status: 404 };
     };
     stubHost({
@@ -465,10 +474,12 @@ function stubRenameHost(options = {}) {
         getRequestHeaders: () => ({}),
         saveMetadataDebounced: () => { metadataSaves += 1; },
         saveSettingsDebounced: () => { settingsSaves += 1; },
+        getOneCharacter: async () => {},
     });
     return {
         names,
         requests,
+        characters: options.characters ?? [],
         chatMetadata,
         powerUserSettings,
         metadataSaves: () => metadataSaves,
@@ -496,6 +507,84 @@ test('renames a world book and migrates the chat and persona bindings', async ()
         assert.deepEqual(host.requests.map(request => request.path), ['/api/worldinfo/edit', '/api/worldinfo/delete']);
         assert.equal(host.requests[0].body.name, 'New');
         assert.equal(host.requests[1].body.name, 'Old');
+    } finally {
+        host.restore();
+    }
+});
+
+test('worlds.rename migrates card links when asked and authorised', async () => {
+    const host = stubRenameHost({
+        characters: [
+            { name: 'Alice', avatar: 'alice.png', data: { extensions: { world: 'Old' } } },
+            { name: 'Bob', avatar: 'bob.png' },
+        ],
+    });
+    registerConsumer();
+    grantPermission(consumerId, 'host.worldinfo.manage');
+    grantPermission(consumerId, 'host.characters.write');
+    try {
+        const result = await executeCapability(EXTENSION_ID, 'worlds.rename',
+            { name: 'Old', to: 'New', confirm: 'Old', migrateCards: true }, { caller: consumerId });
+
+        assert.deepEqual(result, { success: true, data: { from: 'Old', to: 'New', migrated: ['cards'] } });
+        const cardWrite = host.requests.find(request => request.path === '/api/characters/merge-attributes');
+        assert.deepEqual(cardWrite, {
+            path: '/api/characters/merge-attributes',
+            body: { avatar: 'alice.png', data: { extensions: { world: 'New' } } },
+        }, 'only the bound card is rewritten, through the host merge endpoint');
+        assert.equal(host.requests.filter(request => request.path === '/api/characters/merge-attributes').length, 1);
+        assert.equal(host.characters[0].data.extensions.world, 'New');
+        // The old book is only deleted after every link has moved.
+        const paths = host.requests.map(request => request.path);
+        assert.ok(paths.indexOf('/api/characters/merge-attributes') < paths.indexOf('/api/worldinfo/delete'));
+        assert.deepEqual(host.names, ['New']);
+    } finally {
+        host.restore();
+    }
+});
+
+test('card-link migration needs the card write grant and refuses embedded books', async () => {
+    const host = stubRenameHost({
+        characters: [{ name: 'Alice', avatar: 'alice.png', data: { extensions: { world: 'Old' } } }],
+    });
+    registerConsumer();
+    grantPermission(consumerId, 'host.worldinfo.manage');
+    try {
+        const denied = await executeCapability(EXTENSION_ID, 'worlds.rename',
+            { name: 'Old', to: 'New', confirm: 'Old', migrateCards: true }, { caller: consumerId });
+        assert.equal(denied.error.code, 'PERMISSION_DENIED');
+        assert.deepEqual(denied.error.details.missing, ['host.characters.write']);
+        assert.deepEqual(host.requests, [], 'the world book is not touched before the grant');
+
+        // An embedded book is a copy, not a link: it blocks even with migration on.
+        grantPermission(consumerId, 'host.characters.write');
+        host.characters[0].data = { character_book: { name: 'Old' } };
+        const embedded = await executeCapability(EXTENSION_ID, 'worlds.rename',
+            { name: 'Old', to: 'New', confirm: 'Old', migrateCards: true }, { caller: consumerId });
+        assert.equal(embedded.error.code, 'WORLD_IN_USE');
+        assert.deepEqual(embedded.error.details.embeddedBooks, ['Alice']);
+    } finally {
+        host.restore();
+    }
+});
+
+test('a failed card-link migration keeps the old world book', async () => {
+    const host = stubRenameHost({
+        characters: [{ name: 'Alice', avatar: 'alice.png', data: { extensions: { world: 'Old' } } }],
+        failCardWrite: true,
+    });
+    registerConsumer();
+    grantPermission(consumerId, 'host.worldinfo.manage');
+    grantPermission(consumerId, 'host.characters.write');
+    try {
+        const result = await executeCapability(EXTENSION_ID, 'worlds.rename',
+            { name: 'Old', to: 'New', confirm: 'Old', migrateCards: true }, { caller: consumerId });
+        assert.equal(result.error.code, 'CARD_LINK_MIGRATION_FAILED');
+        assert.equal(result.error.details.failed[0].avatar, 'alice.png');
+        assert.ok(host.names.includes('Old'), 'the old book survives a failed migration');
+        assert.ok(host.names.includes('New'), 'the copy already written is reported by presence');
+        assert.ok(!host.requests.some(request => request.path === '/api/worldinfo/delete'),
+            'the old book is never deleted after a partial migration');
     } finally {
         host.restore();
     }
