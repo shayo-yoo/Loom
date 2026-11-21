@@ -1,11 +1,23 @@
+import { createExtensionLoader } from './loader.js';
+
 const EXTENSION_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/i;
+const PERMISSION_PATTERN = /^[a-z0-9][a-z0-9._:-]*$/i;
 const EVENT_NAME_PATTERN = /^[a-z0-9][a-z0-9:._-]*$/i;
-const LOOM_VERSION = '0.7.0';
+const LOOM_VERSION = '0.22.0';
 const capabilityRegistry = new Map();
 const extensionRegistry = new Map();
 const eventListeners = new Map();
 const cleanupRegistry = new Map();
 const stateRegistry = new Map();
+const permissionRegistry = new Map();
+/** Grants loaded from a persistent store, waiting for their extension to register. */
+const pendingGrants = new Map();
+/** Open permission requests by request id, plus a pair index for de-duplication. */
+const permissionRequests = new Map();
+const requestIndexByPair = new Map();
+let permissionRequestCounter = 0;
+let permissionStore = null;
+let stateStore = null;
 
 const JSON_TYPES = new Set(['array', 'boolean', 'null', 'number', 'object', 'string', 'integer']);
 
@@ -19,6 +31,22 @@ function validateEventName(eventName) {
     if (typeof eventName !== 'string' || !EVENT_NAME_PATTERN.test(eventName)) {
         throw new TypeError('Event name must contain only letters, numbers, colon, dot, underscore, or hyphen.');
     }
+}
+
+function validatePermission(permission) {
+    if (typeof permission !== 'string' || !PERMISSION_PATTERN.test(permission)) {
+        throw new TypeError('Permission must contain only letters, numbers, dot, colon, underscore, or hyphen.');
+    }
+}
+
+function normalizePermissionList(permissions) {
+    if (permissions === undefined) return Object.freeze([]);
+    if (!Array.isArray(permissions)) throw new TypeError('Capability permissions must be an array.');
+    const unique = [...new Set(permissions.map(permission => {
+        validatePermission(permission);
+        return permission;
+    }))];
+    return Object.freeze(unique);
 }
 
 /**
@@ -223,6 +251,7 @@ function snapshotCapability(capability) {
         description: capability.description,
         input: capability.input === null ? null : structuredClone(capability.input),
         output: capability.output === null ? null : structuredClone(capability.output),
+        permissions: [...capability.permissions],
     };
 }
 
@@ -257,6 +286,22 @@ export function registerExtension(extension) {
         contentHash,
     });
     extensionRegistry.set(record.id, record);
+    // Grants persisted before this extension registered are applied now, so the
+    // store can be installed at any point in the boot sequence.
+    const pending = pendingGrants.get(record.id);
+    if (pending) {
+        pendingGrants.delete(record.id);
+        applyGrants(record.id, pending);
+    }
+    // State persisted before this extension registered applies now, so the store
+    // can be attached at any point in the boot sequence.
+    if (stateStore) {
+        try {
+            restoreStateSnapshot(record.id, stateStore.load(record.id));
+        } catch (error) {
+            console.warn(`[Loom] Failed to load state for "${record.id}":`, error);
+        }
+    }
     return record;
 }
 
@@ -294,6 +339,7 @@ export function registerCapability(extensionId, capability) {
         description: typeof capability.description === 'string' ? capability.description : '',
         input: capability.input === undefined ? null : structuredClone(capability.input),
         output: capability.output === undefined ? null : structuredClone(capability.output),
+        permissions: normalizePermissionList(capability.permissions),
         execute: capability.execute,
     });
     capabilityRegistry.set(key, { extensionId, capability: record });
@@ -504,6 +550,7 @@ export function setState(extensionId, key, value) {
     requireOwnedKey(extensionId, key);
     if (!stateRegistry.has(extensionId)) stateRegistry.set(extensionId, new Map());
     stateRegistry.get(extensionId).set(key, value);
+    saveStateSnapshot(extensionId);
     return value;
 }
 
@@ -513,12 +560,89 @@ export function deleteState(extensionId, key) {
     if (!state) return false;
     const removed = state.delete(key);
     if (state.size === 0) stateRegistry.delete(extensionId);
+    if (removed) saveStateSnapshot(extensionId);
     return removed;
 }
 
 export function listStateKeys(extensionId) {
     requireRegisteredExtension(extensionId, 'using extension state');
     return [...(stateRegistry.get(extensionId)?.keys() ?? [])].sort();
+}
+
+/**
+ * The persistable view of an extension's state: a plain object of the entries
+ * that survive `structuredClone`. Functions, DOM nodes and other live objects
+ * stay usable in memory but are reported and skipped, because persisting them
+ * would either throw or silently change them on the next load.
+ */
+function stateSnapshot(extensionId) {
+    const state = stateRegistry.get(extensionId);
+    if (!state || state.size === 0) return null;
+    const snapshot = {};
+    let skipped = 0;
+    for (const [key, value] of state) {
+        try {
+            snapshot[key] = structuredClone(value);
+        } catch {
+            skipped += 1;
+        }
+    }
+    if (skipped > 0) {
+        console.warn(`[Loom] ${skipped} state value(s) of "${extensionId}" are not cloneable and were not persisted.`);
+    }
+    return Object.keys(snapshot).length > 0 ? snapshot : null;
+}
+
+function saveStateSnapshot(extensionId) {
+    if (!stateStore) return;
+    try {
+        const snapshot = stateSnapshot(extensionId);
+        if (snapshot === null) stateStore.remove(extensionId);
+        else stateStore.save(extensionId, snapshot);
+    } catch (error) {
+        console.warn(`[Loom] Failed to persist state for "${extensionId}":`, error);
+    }
+}
+
+function restoreStateSnapshot(extensionId, snapshot) {
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return;
+    const existing = stateRegistry.get(extensionId);
+    const target = existing ?? new Map();
+    for (const [key, value] of Object.entries(snapshot)) {
+        // Never clobber a value that was written after the snapshot was taken.
+        if (target.has(key)) continue;
+        target.set(key, value);
+    }
+    if (target.size > 0) stateRegistry.set(extensionId, target);
+}
+
+/**
+ * Install an optional persistent store for extension state.
+ *
+ * Core owns the namespace isolation; the store only reads and writes one
+ * extension's snapshot, so the host decides where it lives. Without a store,
+ * state is page-scoped exactly as before.
+ *
+ * @param {{ load: (extensionId: string) => object|null, save: (extensionId: string, snapshot: object) => void, remove: (extensionId: string) => void } | null} store
+ */
+export function setStateStore(store) {
+    if (store !== null && store !== undefined) {
+        const methods = ['load', 'save', 'remove'];
+        if (typeof store !== 'object' || methods.some(method => typeof store[method] !== 'function')) {
+            throw new TypeError('State store must provide load(extensionId), save(extensionId, snapshot) and remove(extensionId).');
+        }
+    }
+    stateStore = store ?? null;
+    if (!stateStore) return true;
+
+    for (const extensionId of extensionRegistry.keys()) {
+        try {
+            restoreStateSnapshot(extensionId, stateStore.load(extensionId));
+        } catch (error) {
+            console.warn(`[Loom] Failed to load state for "${extensionId}":`, error);
+        }
+    }
+    return true;
 }
 
 function createFailure(code, message, details = undefined) {
@@ -528,10 +652,232 @@ function createFailure(code, message, details = undefined) {
     };
 }
 
-export async function executeCapability(extensionId, capabilityId, input) {
+/**
+ * Normalize a persisted grant snapshot into `[{ extensionId, permissions }]`.
+ * Anything malformed is dropped rather than throwing: a corrupted store must not
+ * stop the runtime from booting.
+ */
+function normalizeGrantSnapshot(raw) {
+    if (!Array.isArray(raw)) return [];
+    const snapshot = [];
+    for (const entry of raw) {
+        if (!entry || typeof entry !== 'object') continue;
+        if (typeof entry.extensionId !== 'string' || !EXTENSION_ID_PATTERN.test(entry.extensionId)) continue;
+        if (!Array.isArray(entry.permissions)) continue;
+        const permissions = entry.permissions.filter(permission => (
+            typeof permission === 'string' && PERMISSION_PATTERN.test(permission)
+        ));
+        if (permissions.length > 0) snapshot.push({ extensionId: entry.extensionId, permissions });
+    }
+    return snapshot;
+}
+
+function applyGrants(extensionId, permissions) {
+    if (permissions.length === 0) return;
+    if (!permissionRegistry.has(extensionId)) permissionRegistry.set(extensionId, new Set());
+    const granted = permissionRegistry.get(extensionId);
+    for (const permission of permissions) granted.add(permission);
+}
+
+/**
+ * Write the grant table through the store. Storage failures are reported but
+ * never abort the grant itself: the in-memory table stays authoritative.
+ */
+function savePermissionSnapshot() {
+    if (!permissionStore) return;
+    try {
+        permissionStore.save(listPermissions());
+    } catch (error) {
+        console.warn('[Loom] Failed to persist permission grants:', error);
+    }
+}
+
+function loadGrantSnapshot() {
+    if (!permissionStore) return [];
+    try {
+        return normalizeGrantSnapshot(permissionStore.load());
+    } catch (error) {
+        console.warn('[Loom] Failed to load permission grants:', error);
+        return [];
+    }
+}
+
+/**
+ * Install an optional persistent store for the permission grant table.
+ *
+ * Core owns the table; the store only reads and writes a serializable snapshot,
+ * so the host (or any embedding) stays the storage owner. Without a store,
+ * grants live for the page lifetime only.
+ *
+ * @param {{ load: () => Array, save: (grants: Array<{ extensionId: string, permissions: string[] }>) => void } | null} store
+ */
+export function setPermissionStore(store) {
+    if (store !== null && store !== undefined) {
+        if (typeof store !== 'object' || typeof store.load !== 'function' || typeof store.save !== 'function') {
+            throw new TypeError('Permission store must provide load() and save(grants).');
+        }
+    }
+    permissionStore = store ?? null;
+    pendingGrants.clear();
+    if (!permissionStore) return true;
+
+    for (const { extensionId, permissions } of loadGrantSnapshot()) {
+        // Registered extensions get their grants immediately; the rest are
+        // applied when they register, so boot order does not matter.
+        if (extensionRegistry.has(extensionId)) applyGrants(extensionId, permissions);
+        else pendingGrants.set(extensionId, permissions);
+    }
+    return true;
+}
+
+/**
+ * Grant a permission to a registered extension. Permissions are explicit:
+ * declaring them on a capability does not grant them; the caller must hold
+ * every permission its capability declares or the call is rejected.
+ *
+ * Grant and revoke are the operator-facing consent API (Loom UI exposes them in
+ * its panel). This is a cooperative access constraint, not a sandbox: every
+ * Loom script shares the page realm and can call this API directly.
+ */
+export function grantPermission(extensionId, permission) {
+    requireRegisteredExtension(extensionId, 'granting permissions');
+    validatePermission(permission);
+    if (!permissionRegistry.has(extensionId)) permissionRegistry.set(extensionId, new Set());
+    permissionRegistry.get(extensionId).add(permission);
+    savePermissionSnapshot();
+    return true;
+}
+
+export function revokePermission(extensionId, permission) {
+    requireRegisteredExtension(extensionId, 'revoking permissions');
+    validatePermission(permission);
+    const granted = permissionRegistry.get(extensionId);
+    if (!granted) return false;
+    const removed = granted.delete(permission);
+    if (granted.size === 0) permissionRegistry.delete(extensionId);
+    if (removed) savePermissionSnapshot();
+    return removed;
+}
+
+export function checkPermission(extensionId, permission) {
+    validateId(extensionId, 'Extension');
+    validatePermission(permission);
+    return permissionRegistry.get(extensionId)?.has(permission) === true;
+}
+
+export function listPermissions(extensionId) {
+    if (extensionId !== undefined) {
+        requireRegisteredExtension(extensionId, 'listing permissions');
+        return [...(permissionRegistry.get(extensionId) ?? [])].sort();
+    }
+    return [...permissionRegistry.entries()]
+        .map(([id, permissions]) => ({ extensionId: id, permissions: [...permissions].sort() }))
+        .sort((a, b) => a.extensionId.localeCompare(b.extensionId));
+}
+
+function requestPairKey(extensionId, permission) {
+    return `${extensionId}::${permission}`;
+}
+
+/**
+ * Ask the user to grant a permission instead of failing silently.
+ *
+ * A request is an explicit, visible question: asking never grants anything, and
+ * the answer arrives through `resolvePermissionRequest` (normally a UI consent
+ * surface). Requesting an already-held permission resolves immediately; asking
+ * twice for the same pair returns the open request instead of stacking prompts.
+ * Undeclared permission names are allowed on purpose — a capability may register
+ * after the request.
+ *
+ * Emits `core:permission:requested` with `{ request }`.
+ */
+export function requestPermission(extensionId, permission, options = {}) {
+    requireRegisteredExtension(extensionId, 'requesting permissions');
+    validatePermission(permission);
+    const reason = typeof options?.reason === 'string' ? options.reason.slice(0, 500) : '';
+
+    if (checkPermission(extensionId, permission)) {
+        return { requestId: null, status: 'granted', extensionId, permission };
+    }
+
+    const openId = requestIndexByPair.get(requestPairKey(extensionId, permission));
+    if (openId) {
+        return { requestId: openId, status: 'pending', extensionId, permission };
+    }
+
+    const request = {
+        id: `perm-${++permissionRequestCounter}`,
+        extensionId,
+        permission,
+        reason,
+        requestedAt: Date.now(),
+    };
+    permissionRequests.set(request.id, request);
+    requestIndexByPair.set(requestPairKey(extensionId, permission), request.id);
+    void emit('core:permission:requested', { request: { ...request } });
+    return { requestId: request.id, status: 'pending', extensionId, permission };
+}
+
+export function listPermissionRequests() {
+    return [...permissionRequests.values()]
+        .map(request => ({ ...request }))
+        .sort((a, b) => a.extensionId.localeCompare(b.extensionId) || a.permission.localeCompare(b.permission));
+}
+
+/**
+ * Answer a permission request. `{ approved: true }` grants it; anything else
+ * denies and leaves the permission unheld. A stale request id resolves to
+ * `status: 'unknown'` instead of throwing, because a UI may race another surface.
+ *
+ * Emits `core:permission:resolved` with `{ requestId, extensionId, permission, status }`.
+ */
+export function resolvePermissionRequest(requestId, options = {}) {
+    if (typeof requestId !== 'string' || requestId.trim() === '') {
+        throw new TypeError('Permission request id must be a non-empty string.');
+    }
+    const request = permissionRequests.get(requestId);
+    if (!request) return { requestId, status: 'unknown' };
+
+    const approved = Boolean(options?.approved);
+    permissionRequests.delete(requestId);
+    requestIndexByPair.delete(requestPairKey(request.extensionId, request.permission));
+
+    // An extension that unregistered while the prompt was open cannot be granted.
+    const status = approved && extensionRegistry.has(request.extensionId) ? 'granted' : 'denied';
+    if (status === 'granted') grantPermission(request.extensionId, request.permission);
+
+    void emit('core:permission:resolved', {
+        requestId,
+        extensionId: request.extensionId,
+        permission: request.permission,
+        status,
+    });
+    return { requestId, status, extensionId: request.extensionId, permission: request.permission };
+}
+
+/**
+ * Execute a capability through its public contract.
+ *
+ * `options.caller` names the extension making the call; it defaults to the
+ * capability owner (a self-call). Cross-extension calls should pass an explicit
+ * caller so permission checks and caller-scoped behaviour attribute correctly.
+ *
+ * Order of checks: ids -> capability lookup -> caller registration -> input
+ * schema -> declared permissions -> handler -> output schema. Declared
+ * permissions are enforced here rather than inside each handler, so a capability
+ * cannot accidentally run without the grant it advertised.
+ */
+export async function executeCapability(extensionId, capabilityId, input, options = {}) {
     try {
         validateId(extensionId, 'Extension');
         validateId(capabilityId, 'Capability');
+    } catch (error) {
+        return createFailure('INVALID_ID', error.message);
+    }
+
+    const caller = options?.caller ?? extensionId;
+    try {
+        validateId(caller, 'Caller extension');
     } catch (error) {
         return createFailure('INVALID_ID', error.message);
     }
@@ -540,19 +886,47 @@ export async function executeCapability(extensionId, capabilityId, input) {
     if (!entry) return createFailure('CAPABILITY_NOT_FOUND', `Capability not found: ${extensionId}:${capabilityId}`);
 
     const { capability } = entry;
+    if (!extensionRegistry.has(caller)) {
+        return createFailure('CALLER_NOT_FOUND', `Caller extension is not registered: ${caller}`);
+    }
+    // Capability contracts are JSON, and JSON has no `undefined`: a call that
+    // omits the input argument means "no input", which is `null`. Without this,
+    // `executeCapability('host', 'worlds.list')` failed on a null-input schema.
+    const capabilityInput = input === undefined ? null : input;
     if (capability.input) {
-        const errors = validateSchema(input, capability.input);
+        const errors = validateSchema(capabilityInput, capability.input);
         if (errors.length) return createFailure('INVALID_INPUT', 'Capability input did not match its schema.', errors);
     }
 
+    if (capability.permissions.length > 0) {
+        const missing = capability.permissions.filter(permission => !checkPermission(caller, permission));
+        if (missing.length > 0) {
+            return createFailure(
+                'PERMISSION_DENIED',
+                `Extension "${caller}" does not hold the permissions required by ${extensionId}:${capabilityId}.`,
+                { caller, target: extensionId, capabilityId, missing },
+            );
+        }
+    }
+
     try {
-        const data = await capability.execute(input);
+        const data = await capability.execute(capabilityInput, {
+            caller,
+            target: extensionId,
+            capabilityId,
+            capabilityPermissions: [...capability.permissions],
+            hasPermission: permission => checkPermission(caller, permission),
+        });
         if (capability.output) {
             const errors = validateSchema(data, capability.output);
             if (errors.length) return createFailure('INVALID_OUTPUT', 'Capability output did not match its schema.', errors);
         }
         return { success: true, data };
     } catch (error) {
+        // Capabilities may raise typed errors to keep a stable error code in the envelope.
+        if (error && typeof error === 'object' && typeof error.code === 'string') {
+            return createFailure(error.code, error.message || error.code, error.details);
+        }
         return createFailure('EXECUTION_FAILED', error instanceof Error ? error.message : String(error));
     }
 }
@@ -585,9 +959,26 @@ export function unregisterExtension(extensionId) {
 
     extensionRegistry.delete(extensionId);
     stateRegistry.delete(extensionId);
+    permissionRegistry.delete(extensionId);
+    pendingGrants.delete(extensionId);
+    if (stateStore) {
+        try {
+            stateStore.remove(extensionId);
+        } catch (error) {
+            console.warn(`[Loom] Failed to remove persisted state for "${extensionId}":`, error);
+        }
+    }
+    // Drop open prompts for the extension that just went away; answering them
+    // would grant a permission nothing can use.
+    for (const [requestId, request] of [...permissionRequests]) {
+        if (request.extensionId !== extensionId) continue;
+        permissionRequests.delete(requestId);
+        requestIndexByPair.delete(requestPairKey(extensionId, request.permission));
+    }
     for (const [key, entry] of capabilityRegistry) {
         if (entry.extensionId === extensionId) capabilityRegistry.delete(key);
     }
+    savePermissionSnapshot();
     return { removed: true, cleanupErrors };
 }
 
@@ -604,16 +995,44 @@ function countStateKeys() {
 }
 
 export function getRuntimeInfo() {
+    const states = extensionLoader.listExtensionStates();
     return Object.freeze({
         name: 'Loom',
         version: LOOM_VERSION,
         extensionCount: extensionRegistry.size,
+        activeExtensionCount: states.filter(state => state.state === 'active').length,
+        failedExtensionCount: states.filter(state => state.state === 'failed').length,
         capabilityCount: capabilityRegistry.size,
         eventCount: eventListeners.size,
         listenerCount: countListeners(),
         stateKeyCount: countStateKeys(),
+        grantedPermissionCount: [...permissionRegistry.values()].reduce((total, set) => total + set.size, 0),
+        permissionRequestCount: permissionRequests.size,
+        permissionStoreAttached: permissionStore !== null,
+        stateStoreAttached: stateStore !== null,
     });
 }
+
+const extensionLoader = createExtensionLoader({
+    registerExtension,
+    unregisterExtension,
+    listExtensions,
+    requestPermission,
+    emit,
+});
+
+// Named exports so tests and other modules can reach the lifecycle API directly;
+// the same functions are spread onto `globalThis.Loom` below.
+export const {
+    loadExtension,
+    activateExtension,
+    deactivateExtension,
+    unloadExtension,
+    listExtensionStates,
+    getExtensionState,
+    startExtensions,
+    importExtension,
+} = extensionLoader;
 
 const api = Object.freeze({
     registerExtension,
@@ -633,6 +1052,16 @@ const api = Object.freeze({
     setState,
     deleteState,
     listStateKeys,
+    grantPermission,
+    revokePermission,
+    checkPermission,
+    listPermissions,
+    requestPermission,
+    listPermissionRequests,
+    resolvePermissionRequest,
+    setPermissionStore,
+    setStateStore,
+    ...extensionLoader,
     unregisterExtension,
     getRuntimeInfo,
 });

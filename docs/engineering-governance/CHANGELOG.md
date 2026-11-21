@@ -1,5 +1,22 @@
 # Change Log
 
+- [CHG-20261121-024](history/recent/CHG-20261121-024.md): World-book data movement — `worlds.export`/`import`/`rename`, binding migration, and the host-cache write fix (0.22.0).
+- [CHG-20261121-023](history/recent/CHG-20261121-023.md): Whole world-book lifecycle — `worlds.create`/`worlds.remove` behind `host.worldinfo.manage` with a name-echo confirmation (0.21.0).
+- [CHG-20261121-022](history/recent/CHG-20261121-022.md): Host message write — `chat.append` system messages gated by `host.chat.write`, with mandatory rollback (0.20.0).
+- [CHG-20261121-021](history/recent/CHG-20261121-021.md): Optional extension-state persistence — `setStateStore`, host store under `__loom.state`, cloneable-only snapshots (0.19.0).
+- [CHG-20261121-020](history/recent/CHG-20261121-020.md): `tabs` becomes a controlled component; declared state and rendered state can no longer diverge (0.18.0).
+- [CHG-20261121-019](history/recent/CHG-20261121-019.md): Consent prompt shows capability contracts; `startExtensions` dependency-ordered boot and `importExtension` module loading (0.17.0).
+- [CHG-20261121-018](history/recent/CHG-20261121-018.md): Keyed reconciliation — entry-tree renderer, `key` prop, incremental `setChildren`/`appendChild`/`remove`, handler rebinding (0.16.0).
+- [CHG-20261121-017](history/recent/CHG-20261121-017.md): UI engine lifecycle — `onCleanup`/`onMount`/`unmount`, document-level modal Escape with focus trap and restore, CSS selector fixes (0.15.0).
+- [CHG-20261121-016](history/recent/CHG-20261121-016.md): UI deepening — in-place prop updates, view serialization, `image`/`tabs`/`modal`/`menu` components (0.14.0, parallel stream).
+- [CHG-20261121-015](history/recent/CHG-20261121-015.md): Extension loader — manifests, activation lifecycle, dependency gating, permission declarations, load-failure isolation (0.14.0, parallel stream).
+- [CHG-20261121-014](history/recent/CHG-20261121-014.md): World entry create/remove with host-mirrored uid allocation; real write round-trip in the browser harness (0.13.0).
+- [CHG-20261121-013](history/recent/CHG-20261121-013.md): Permission request flow — `requestPermission` / consent prompt rendered through the view engine (0.12.0).
+- [CHG-20261121-012](history/recent/CHG-20261121-012.md): Browser verification harness (`npm run verify:browser`, 38 checks); fixed omitted-input rejection and missing-world error code (0.11.1).
+- [CHG-20261121-011](history/recent/CHG-20261121-011.md): World-book write contract — `worlds.entry.update` entry patch, gated by `host.worldinfo.write` (0.11.0).
+- [CHG-20261121-010](history/recent/CHG-20261121-010.md): Host read coverage — `chat.messages` (gated by `host.chat.read`), `worlds.entries`, `characters.get` (0.10.0).
+- [CHG-20261121-009](history/recent/CHG-20261121-009.md): Persistent permission grants via `setPermissionStore`, host store under `extensionSettings.__loom` (0.9.0).
+- [CHG-20261120-008](history/recent/CHG-20261120-008.md): Capability permissions enforced in Core, caller-scoped host settings capabilities, panel permission toggles (0.8.0).
 - [CHG-20261120-007](history/recent/CHG-20261120-007.md): Settings-panel second entry, `viewport.get` capability, and mobile-safe layout groundwork.
 - [CHG-20261119-006](history/recent/CHG-20261119-006.md): Extension identity, content fingerprints, and duplicate/conflict detection.
 - [CHG-20261119-005](history/recent/CHG-20261119-005.md): Loom UI component registry, declarative view engine, and `LoomUI` facade.

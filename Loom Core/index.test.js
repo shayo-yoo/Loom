@@ -4,30 +4,42 @@ import assert from 'node:assert/strict';
 import {
     addCleanup,
     checkInstall,
+    checkPermission,
     computeContentHash,
     deleteState,
     emit,
     executeCapability,
     getRuntimeInfo,
     getState,
+    grantPermission,
     listCapabilities,
     listEvents,
     listExtensions,
     listIdentityConflicts,
     listIdentityGroups,
+    listPermissionRequests,
+    listPermissions,
     listStateKeys,
     registerCapability,
     registerExtension,
+    requestPermission,
+    resolvePermissionRequest,
+    revokePermission,
+    setPermissionStore,
     setState,
+    setStateStore,
     subscribe,
     unregisterExtension,
 } from './index.js';
 
 const extensionId = 'test-suite';
 const eventsId = 'test-events';
+const callerId = 'test-caller';
 afterEach(() => {
     unregisterExtension(extensionId);
     unregisterExtension(eventsId);
+    unregisterExtension(callerId);
+    unregisterExtension('valid-but-bad-perm');
 });
 
 const requestSchema = {
@@ -339,4 +351,528 @@ test('unregistering an extension removes its listeners and runs cleanups', async
     assert.deepEqual(await emit('demo:cleanup', null), { delivered: 0, errors: [] });
     assert.deepEqual(received, ['called', 'cleanup']);
     assert.equal(getRuntimeInfo().listenerCount, 0);
+});
+
+function setupPermissionedCapability() {
+    registerExtension({ id: extensionId, name: 'Permissioned Provider' });
+    registerExtension({ id: callerId, name: 'Permissioned Caller' });
+    registerCapability(extensionId, {
+        id: 'guarded',
+        name: 'Guarded',
+        permissions: ['demo.read', 'demo.read', 'demo.write'],
+        input: { type: 'null' },
+        output: { type: 'object', required: ['caller'], properties: { caller: { type: 'string' } } },
+        execute: (input, context) => ({ caller: context.caller }),
+    });
+    registerCapability(extensionId, {
+        id: 'open',
+        name: 'Open',
+        input: { type: 'null' },
+        execute: () => 'public',
+    });
+}
+
+test('normalizes declared capability permissions and exposes them in descriptors', () => {
+    setupPermissionedCapability();
+    const guarded = listCapabilities(extensionId).find(capability => capability.id === 'guarded');
+    assert.deepEqual(guarded.permissions, ['demo.read', 'demo.write'], 'duplicates collapse, order preserved');
+    const open = listCapabilities(extensionId).find(capability => capability.id === 'open');
+    assert.deepEqual(open.permissions, []);
+});
+
+test('rejects malformed permission declarations at registration time', () => {
+    registerExtension({ id: extensionId, name: 'Permissioned Provider' });
+    assert.throws(() => registerCapability(extensionId, {
+        id: 'bad-type', name: 'Bad', permissions: 'demo.read', execute: () => undefined,
+    }), /permissions must be an array/);
+    assert.throws(() => registerCapability(extensionId, {
+        id: 'bad-name', name: 'Bad', permissions: ['bad permission'], execute: () => undefined,
+    }), /Permission must contain/);
+});
+
+test('enforces declared permissions in Core before the handler runs', async () => {
+    setupPermissionedCapability();
+    let executed = 0;
+    registerCapability(extensionId, {
+        id: 'counted',
+        name: 'Counted',
+        permissions: ['demo.write'],
+        input: { type: 'null' },
+        execute: () => { executed += 1; return null; },
+    });
+
+    const denied = await executeCapability(extensionId, 'counted', null, { caller: callerId });
+    assert.equal(denied.success, false);
+    assert.equal(denied.error.code, 'PERMISSION_DENIED');
+    assert.deepEqual(denied.error.details.missing, ['demo.write']);
+    assert.equal(executed, 0, 'the handler must not run without the grant');
+
+    grantPermission(callerId, 'demo.write');
+    assert.deepEqual(await executeCapability(extensionId, 'counted', null, { caller: callerId }), { success: true, data: null });
+    assert.equal(executed, 1);
+
+    // Permissions are all-or-nothing: holding one of two is still a denial.
+    grantPermission(callerId, 'demo.read');
+    revokePermission(callerId, 'demo.write');
+    const partial = await executeCapability(extensionId, 'guarded', null, { caller: callerId });
+    assert.equal(partial.error.code, 'PERMISSION_DENIED');
+    assert.deepEqual(partial.error.details.missing, ['demo.write']);
+});
+
+test('permission checks apply to self-calls too', async () => {
+    setupPermissionedCapability();
+    const selfCall = await executeCapability(extensionId, 'guarded', null);
+    assert.equal(selfCall.error.code, 'PERMISSION_DENIED');
+    assert.equal(selfCall.error.details.caller, extensionId);
+
+    grantPermission(extensionId, 'demo.read');
+    grantPermission(extensionId, 'demo.write');
+    assert.deepEqual(await executeCapability(extensionId, 'guarded', null), {
+        success: true,
+        data: { caller: extensionId },
+    });
+});
+
+test('capabilities without declared permissions need no grant', async () => {
+    setupPermissionedCapability();
+    assert.deepEqual(await executeCapability(extensionId, 'open', null, { caller: callerId }), {
+        success: true,
+        data: 'public',
+    });
+});
+
+test('passes caller context and a permission probe to the handler', async () => {
+    registerExtension({ id: extensionId, name: 'Provider' });
+    registerExtension({ id: callerId, name: 'Caller' });
+    let seen = null;
+    registerCapability(extensionId, {
+        id: 'inspect',
+        name: 'Inspect',
+        input: { type: 'null' },
+        execute: (input, context) => {
+            seen = {
+                caller: context.caller,
+                target: context.target,
+                capabilityId: context.capabilityId,
+                permissions: context.capabilityPermissions,
+                has: context.hasPermission('demo.write'),
+            };
+            return null;
+        },
+    });
+
+    await executeCapability(extensionId, 'inspect', null, { caller: callerId });
+    assert.deepEqual(seen, {
+        caller: callerId,
+        target: extensionId,
+        capabilityId: 'inspect',
+        permissions: [],
+        has: false,
+    });
+
+    grantPermission(callerId, 'demo.write');
+    await executeCapability(extensionId, 'inspect', null, { caller: callerId });
+    assert.equal(seen.has, true, 'the probe must reflect the caller, not the owner');
+});
+
+test('rejects calls from unregistered callers', async () => {
+    setupPermissionedCapability();
+    const result = await executeCapability(extensionId, 'open', null, { caller: 'ghost-extension' });
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, 'CALLER_NOT_FOUND');
+    assert.equal(
+        (await executeCapability(extensionId, 'open', null, { caller: 'bad caller' })).error.code,
+        'INVALID_ID',
+    );
+});
+
+test('grants, revokes and lists permissions per extension', () => {
+    registerExtension({ id: extensionId, name: 'Provider' });
+    registerExtension({ id: callerId, name: 'Caller' });
+
+    assert.deepEqual(listPermissions(callerId), []);
+    assert.equal(checkPermission(callerId, 'demo.write'), false);
+    assert.equal(grantPermission(callerId, 'demo.write'), true);
+    grantPermission(callerId, 'demo.read');
+    assert.equal(checkPermission(callerId, 'demo.write'), true);
+    assert.deepEqual(listPermissions(callerId), ['demo.read', 'demo.write']);
+    assert.equal(getRuntimeInfo().grantedPermissionCount, 2);
+
+    assert.equal(revokePermission(callerId, 'demo.write'), true);
+    assert.equal(revokePermission(callerId, 'demo.write'), false);
+    assert.equal(checkPermission(callerId, 'demo.write'), false);
+
+    assert.deepEqual(listPermissions().find(entry => entry.extensionId === callerId), {
+        extensionId: callerId,
+        permissions: ['demo.read'],
+    });
+    assert.throws(() => grantPermission('not-registered', 'demo.read'), /Register the extension/);
+    assert.throws(() => grantPermission(callerId, 'bad permission'), /Permission must contain/);
+    assert.throws(() => listPermissions('not-registered'), /Register the extension/);
+});
+
+test('declaring a permission on a capability does not grant it', async () => {
+    setupPermissionedCapability();
+    assert.deepEqual(listPermissions(extensionId), [], 'registration must not self-grant');
+    assert.equal(checkPermission(extensionId, 'demo.read'), false);
+});
+
+test('unregistering an extension drops its grants', () => {
+    registerExtension({ id: callerId, name: 'Caller' });
+    grantPermission(callerId, 'demo.write');
+    assert.equal(getRuntimeInfo().grantedPermissionCount, 1);
+    assert.deepEqual(unregisterExtension(callerId), { removed: true, cleanupErrors: [] });
+    assert.equal(getRuntimeInfo().grantedPermissionCount, 0);
+    assert.equal(checkPermission(callerId, 'demo.write'), false);
+});
+
+function memoryStateStore(initial = {}) {
+    const data = new Map(Object.entries(initial).map(([id, snapshot]) => [id, structuredClone(snapshot)]));
+    const calls = { saves: [], removes: [] };
+    return {
+        data,
+        calls,
+        load: id => (data.has(id) ? structuredClone(data.get(id)) : null),
+        save: (id, snapshot) => {
+            data.set(id, structuredClone(snapshot));
+            calls.saves.push(id);
+        },
+        remove: id => {
+            data.delete(id);
+            calls.removes.push(id);
+        },
+    };
+}
+
+test('restores persisted state when the extension registers', () => {
+    const store = memoryStateStore({ [eventsId]: { counter: 7, label: 'restored' } });
+    setStateStore(store);
+    try {
+        assert.equal(getRuntimeInfo().stateStoreAttached, true);
+        registerExtension({ id: eventsId, name: 'Events' });
+        assert.equal(getState(eventsId, 'counter'), 7);
+        assert.equal(getState(eventsId, 'label'), 'restored');
+        assert.deepEqual(listStateKeys(eventsId), ['counter', 'label']);
+    } finally {
+        setStateStore(null);
+    }
+});
+
+test('restores state for extensions that registered before the store attached', () => {
+    registerExtension({ id: eventsId, name: 'Events' });
+    setState(eventsId, 'live', 'kept');
+    const store = memoryStateStore({ [eventsId]: { persisted: 1, live: 'stale' } });
+    setStateStore(store);
+    try {
+        assert.equal(getState(eventsId, 'persisted'), 1, 'persisted keys are restored');
+        assert.equal(getState(eventsId, 'live'), 'kept', 'a live value is never clobbered by the snapshot');
+    } finally {
+        setStateStore(null);
+    }
+});
+
+test('persists state on set and delete, and removes it on unregister', () => {
+    registerExtension({ id: eventsId, name: 'Events' });
+    const store = memoryStateStore();
+    setStateStore(store);
+    try {
+        setState(eventsId, 'counter', 1);
+        assert.deepEqual(store.data.get(eventsId), { counter: 1 });
+
+        setState(eventsId, 'label', 'alpha');
+        assert.deepEqual(store.data.get(eventsId), { counter: 1, label: 'alpha' });
+
+        assert.equal(deleteState(eventsId, 'counter'), true);
+        assert.deepEqual(store.data.get(eventsId), { label: 'alpha' });
+
+        // Removing the last key drops the namespace instead of storing an empty one.
+        deleteState(eventsId, 'label');
+        assert.equal(store.data.has(eventsId), false);
+        assert.equal(store.calls.removes.includes(eventsId), true);
+
+        setState(eventsId, 'again', true);
+        unregisterExtension(eventsId);
+        assert.equal(store.data.has(eventsId), false, 'unregister removes the persisted namespace');
+    } finally {
+        setStateStore(null);
+    }
+});
+
+test('state snapshots skip values that cannot be cloned', () => {
+    registerExtension({ id: eventsId, name: 'Events' });
+    const store = memoryStateStore();
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.join(' '));
+    setStateStore(store);
+    try {
+        setState(eventsId, 'fn', () => {});
+        setState(eventsId, 'ok', 42);
+        assert.deepEqual(store.data.get(eventsId), { ok: 42 }, 'the cloneable value is still persisted');
+        assert.equal(getState(eventsId, 'fn') instanceof Function, true, 'the live value stays usable in memory');
+        assert.equal(warnings.some(message => message.includes('not cloneable')), true);
+    } finally {
+        setStateStore(null);
+        console.warn = originalWarn;
+    }
+});
+
+test('rejects a malformed state store and isolates its failures', () => {
+    assert.throws(() => setStateStore({ load: () => null }), /must provide load\(extensionId\)/);
+    assert.throws(() => setStateStore('store'), /must provide load\(extensionId\)/);
+
+    registerExtension({ id: eventsId, name: 'Events' });
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.join(' '));
+    setStateStore({
+        load: () => { throw new Error('load boom'); },
+        save: () => { throw new Error('save boom'); },
+        remove: () => { throw new Error('remove boom'); },
+    });
+    try {
+        assert.equal(setState(eventsId, 'key', 'value'), 'value');
+        assert.equal(getState(eventsId, 'key'), 'value', 'in-memory state survives a broken store');
+        assert.equal(warnings.some(message => message.includes('save boom')), true);
+        unregisterExtension(eventsId);
+        assert.equal(warnings.some(message => message.includes('remove boom')), true);
+    } finally {
+        setStateStore(null);
+        console.warn = originalWarn;
+    }
+});
+
+test('detaching the state store keeps the in-memory state', () => {
+    registerExtension({ id: eventsId, name: 'Events' });
+    setStateStore(memoryStateStore());
+    setState(eventsId, 'key', 1);
+    setStateStore(null);
+    assert.equal(getRuntimeInfo().stateStoreAttached, false);
+    assert.equal(getState(eventsId, 'key'), 1);
+});
+
+test('treats an omitted input argument as null, not as a schema violation', async () => {
+    registerExtension({ id: extensionId, name: 'Null Input Provider' });
+    registerCapability(extensionId, {
+        id: 'null-input',
+        name: 'Null input',
+        input: { type: 'null' },
+        output: { type: 'string' },
+        execute: input => (input === null ? 'received-null' : `received-${typeof input}`),
+    });
+
+    assert.deepEqual(await executeCapability(extensionId, 'null-input'), {
+        success: true,
+        data: 'received-null',
+    });
+    assert.deepEqual(await executeCapability(extensionId, 'null-input', null), {
+        success: true,
+        data: 'received-null',
+    });
+});
+
+test('typed capability errors keep their code in the failure envelope', async () => {
+    registerExtension({ id: extensionId, name: 'Provider' });
+    registerCapability(extensionId, {
+        id: 'typed',
+        name: 'Typed',
+        input: { type: 'null' },
+        execute: () => {
+            const error = new Error('denied by handler');
+            error.code = 'HANDLER_DENIED';
+            error.details = { reason: 'demo' };
+            throw error;
+        },
+    });
+
+    assert.deepEqual(await executeCapability(extensionId, 'typed', null), {
+        success: false,
+        error: { code: 'HANDLER_DENIED', message: 'denied by handler', details: { reason: 'demo' } },
+    });
+});
+
+function memoryStore(initial = []) {
+    const state = { grants: structuredClone(initial), saves: [] };
+    return {
+        state,
+        load: () => structuredClone(state.grants),
+        save: grants => {
+            state.grants = structuredClone(grants);
+            state.saves.push(structuredClone(grants));
+        },
+    };
+}
+
+test('rejects a malformed permission store', () => {
+    assert.throws(() => setPermissionStore({ load: () => [] }), /must provide load\(\) and save/);
+    assert.throws(() => setPermissionStore('store'), /must provide load\(\) and save/);
+    assert.equal(setPermissionStore(null), true);
+    assert.equal(getRuntimeInfo().permissionStoreAttached, false);
+});
+
+test('restores persisted grants for registered and later-registered extensions', () => {
+    registerExtension({ id: extensionId, name: 'Provider' });
+    const store = memoryStore([
+        { extensionId, permissions: ['demo.read'] },
+        { extensionId: callerId, permissions: ['demo.write'] },
+        { extensionId: 'not yet registered', permissions: ['demo.write'] },
+        { extensionId: 'valid-but-bad-perm', permissions: ['bad perm'] },
+        { extensionId: 'bad-shape', permissions: 'demo.write' },
+        null,
+    ]);
+
+    setPermissionStore(store);
+    try {
+        assert.equal(getRuntimeInfo().permissionStoreAttached, true);
+        assert.equal(checkPermission(extensionId, 'demo.read'), true, 'registered extensions restore immediately');
+
+        registerExtension({ id: callerId, name: 'Caller' });
+        assert.equal(checkPermission(callerId, 'demo.write'), true, 'pending grants apply on registration');
+
+        registerExtension({ id: 'valid-but-bad-perm', name: 'Bad permission' });
+        assert.deepEqual(listPermissions('valid-but-bad-perm'), [], 'invalid permission names are dropped');
+    } finally {
+        setPermissionStore(null);
+    }
+});
+
+test('persists the grant table on grant, revoke and unregister', () => {
+    registerExtension({ id: callerId, name: 'Caller' });
+    const store = memoryStore();
+    setPermissionStore(store);
+    try {
+        grantPermission(callerId, 'demo.write');
+        assert.deepEqual(store.state.grants, [{ extensionId: callerId, permissions: ['demo.write'] }]);
+
+        revokePermission(callerId, 'demo.write');
+        assert.deepEqual(store.state.grants, []);
+
+        grantPermission(callerId, 'demo.read');
+        unregisterExtension(callerId);
+        assert.deepEqual(store.state.grants, [], 'unregistering an extension persists its removal');
+        assert.equal(store.state.saves.length, 4);
+    } finally {
+        setPermissionStore(null);
+    }
+});
+
+test('requests a permission and resolves it after approval', () => {
+    registerExtension({ id: callerId, name: 'Caller' });
+
+    const result = requestPermission(callerId, 'host.settings.write', { reason: 'needs to save' });
+    assert.equal(result.status, 'pending');
+    assert.match(result.requestId, /^perm-\d+$/);
+    assert.equal(checkPermission(callerId, 'host.settings.write'), false, 'requesting must not grant');
+
+    assert.deepEqual(listPermissionRequests().map(request => ({
+        extensionId: request.extensionId,
+        permission: request.permission,
+        reason: request.reason,
+    })), [{ extensionId: callerId, permission: 'host.settings.write', reason: 'needs to save' }]);
+    assert.equal(getRuntimeInfo().permissionRequestCount, 1);
+
+    const resolved = resolvePermissionRequest(result.requestId, { approved: true });
+    assert.deepEqual(resolved, {
+        requestId: result.requestId,
+        status: 'granted',
+        extensionId: callerId,
+        permission: 'host.settings.write',
+    });
+    assert.equal(checkPermission(callerId, 'host.settings.write'), true);
+    assert.deepEqual(listPermissionRequests(), []);
+    assert.equal(getRuntimeInfo().permissionRequestCount, 0);
+});
+
+test('emits request and resolution events with the request payload', async () => {
+    registerExtension({ id: callerId, name: 'Caller' });
+    const events = [];
+    subscribe(callerId, 'core:permission:requested', payload => events.push(['requested', payload]));
+    subscribe(callerId, 'core:permission:resolved', payload => events.push(['resolved', payload]));
+
+    const { requestId } = requestPermission(callerId, 'host.chat.read', { reason: 'read chat' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    resolvePermissionRequest(requestId, { approved: false });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    assert.equal(events.length, 2);
+    assert.deepEqual(events[0][1].request.permission, 'host.chat.read');
+    assert.deepEqual(events[1][1], {
+        requestId,
+        extensionId: callerId,
+        permission: 'host.chat.read',
+        status: 'denied',
+    });
+    assert.equal(checkPermission(callerId, 'host.chat.read'), false, 'a denied request must not grant');
+});
+
+test('de-duplicates open requests and short-circuits already-granted permissions', () => {
+    registerExtension({ id: callerId, name: 'Caller' });
+
+    const first = requestPermission(callerId, 'host.settings.write', { reason: 'first reason' });
+    const second = requestPermission(callerId, 'host.settings.write', { reason: 'second reason' });
+    assert.equal(second.requestId, first.requestId, 'a repeated request reuses the open prompt');
+    assert.equal(listPermissionRequests().length, 1);
+    assert.equal(listPermissionRequests()[0].reason, 'first reason');
+
+    grantPermission(callerId, 'host.settings.write');
+    assert.deepEqual(requestPermission(callerId, 'host.settings.write'), {
+        requestId: null,
+        status: 'granted',
+        extensionId: callerId,
+        permission: 'host.settings.write',
+    });
+    assert.equal(listPermissionRequests().length, 1, 'an already-open request stays open');
+});
+
+test('answering a stale request id is reported, not thrown', () => {
+    assert.deepEqual(resolvePermissionRequest('perm-does-not-exist', { approved: true }), {
+        requestId: 'perm-does-not-exist',
+        status: 'unknown',
+    });
+    assert.throws(() => resolvePermissionRequest(''), /non-empty string/);
+    assert.throws(() => resolvePermissionRequest(42), /non-empty string/);
+});
+
+test('validates permission requests and drops prompts when the extension goes away', () => {
+    registerExtension({ id: callerId, name: 'Caller' });
+    assert.throws(() => requestPermission('not-registered', 'host.chat.read'), /Register the extension/);
+    assert.throws(() => requestPermission(callerId, 'bad permission'), /Permission must contain/);
+
+    const { requestId } = requestPermission(callerId, 'host.chat.read');
+    assert.equal(listPermissionRequests().length, 1);
+
+    unregisterExtension(callerId);
+    assert.deepEqual(listPermissionRequests(), [], 'unregistering drops the open prompt');
+    assert.equal(resolvePermissionRequest(requestId, { approved: true }).status, 'unknown');
+});
+
+test('approving after the extension unregistered cannot grant', () => {
+    registerExtension({ id: callerId, name: 'Caller' });
+    registerExtension({ id: extensionId, name: 'Other' });
+    const { requestId } = requestPermission(callerId, 'host.chat.read');
+
+    // Simulate a race: the request is still open when the extension disappears.
+    unregisterExtension(callerId);
+    registerExtension({ id: callerId, name: 'Caller' });
+    assert.equal(resolvePermissionRequest(requestId, { approved: true }).status, 'unknown');
+    assert.equal(checkPermission(callerId, 'host.chat.read'), false);
+});
+
+test('a failing store never breaks the in-memory grant table', () => {    registerExtension({ id: callerId, name: 'Caller' });
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.join(' '));
+    setPermissionStore({
+        load: () => { throw new Error('load boom'); },
+        save: () => { throw new Error('save boom'); },
+    });
+    try {
+        assert.equal(grantPermission(callerId, 'demo.write'), true);
+        assert.equal(checkPermission(callerId, 'demo.write'), true);
+        assert.equal(warnings.some(message => message.includes('load boom')), true);
+        assert.equal(warnings.some(message => message.includes('save boom')), true);
+    } finally {
+        setPermissionStore(null);
+        console.warn = originalWarn;
+    }
 });
