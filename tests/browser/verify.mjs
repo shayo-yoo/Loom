@@ -1386,6 +1386,17 @@ async function probeRenameCardLinks(cdp) {
 }
 
 async function probeExtensionInstall(cdp) {
+    // Start from a clean installer state: a previous run may have left a package
+    // disabled or a URL install behind, and those choices now survive reloads.
+    // Only the UI installer's own bookkeeping is reset; grants are untouched.
+    await cdp.waitFor("return window.LoomUI?.isReady?.() === true;", SETTLE_TIMEOUT_MS, 'installer ready before reset');
+    await cdp.evaluate(`const Loom = window.Loom;
+        for (const script of (Loom.getState('loom-ui', 'scripts') ?? [])) await window.LoomUI.deleteScript(script.id);
+        for (const id of (Loom.getState('loom-ui', 'disabledExtensions') ?? [])) await window.LoomUI.setExtensionEnabled(id, true);
+        for (const entry of (Loom.getState('loom-ui', 'installedExtensions') ?? [])) await window.LoomUI.uninstallExtension(entry.id ?? entry.entry);
+        return true;`);
+    await cdp.evaluate('await new Promise(resolve => setTimeout(resolve, 2000)); return true;');
+
     // Bundled discovery: hello-loom ships with Loom and must be indexed and active.
     const bundled = await cdp.evaluate(`const Loom = window.Loom;
         const response = await fetch('/scripts/extensions/third-party/Loom/extensions/index.json');
@@ -1720,6 +1731,185 @@ async function probeWorldRename(cdp) {
     assertThat('rename probe cleans up after itself', cleaned.removed === true && cleaned.stillListed === false, JSON.stringify(cleaned));
 }
 
+async function probeExtensionManagement(cdp) {
+    // Boot loads the index, imports packages and runs scripts asynchronously.
+    await cdp.waitFor("return window.LoomUI?.isReady?.() === true;", SETTLE_TIMEOUT_MS, 'installer boot');
+    // A previous failed run may have left hello-loom disabled; start from enabled so
+    // this probe tests its own behaviour instead of the leftovers.
+    await cdp.evaluate(`if ((window.Loom.getState('loom-ui', 'disabledExtensions') ?? []).includes('hello-loom')) {
+        await window.LoomUI.setExtensionEnabled('hello-loom', true);
+    }`);
+    await cdp.waitFor(
+        "return window.Loom?.getExtensionState('hello-loom')?.state === 'active' ? true : false;",
+        SETTLE_TIMEOUT_MS, 'hello-loom active',
+    );
+    const active = await cdp.evaluate(`return {
+        state: window.Loom.getExtensionState('hello-loom')?.state ?? null,
+        capabilities: window.Loom.listCapabilities('hello-loom').length,
+    };`);
+    assertThat('the bundled extension starts active', active.state === 'active' && active.capabilities === 1,
+        JSON.stringify(active));
+
+    const disabled = await cdp.evaluate(`await window.LoomUI.setExtensionEnabled('hello-loom', false);
+        await new Promise(resolve => setTimeout(resolve, 200));
+        return {
+            registered: window.Loom.listExtensions().some(entry => entry.id === 'hello-loom'),
+            capabilities: window.Loom.listCapabilities('hello-loom').length,
+            persisted: (window.Loom.getState('loom-ui', 'disabledExtensions') ?? []).includes('hello-loom'),
+            listed: document.getElementById('loom_installer')?.textContent.includes('已停用') ?? false,
+        };`);
+    assertThat('disabling unregisters the extension and persists the choice',
+        disabled.registered === false && disabled.capabilities === 0
+        && disabled.persisted === true && disabled.listed === true,
+        JSON.stringify(disabled));
+
+    // The disabled choice must survive a page reload: the installer skips it on boot.
+    // Give SillyTavern's debounced settings save time to flush before navigating.
+    await cdp.evaluate('await new Promise(resolve => setTimeout(resolve, 4000)); return true;');
+    await cdp.send('Page.navigate', { url: ST_URL });
+    await cdp.waitFor("return Boolean(window.Loom && window.LoomUI);", READY_TIMEOUT_MS, 'boot after disable');
+    await cdp.waitFor("return window.LoomUI?.isReady?.() === true;", SETTLE_TIMEOUT_MS, 'installer boot after reload');
+    const afterReload = await cdp.evaluate(`return {
+        registered: window.Loom.listExtensions().some(entry => entry.id === 'hello-loom'),
+        persisted: (window.Loom.getState('loom-ui', 'disabledExtensions') ?? []).includes('hello-loom'),
+    };`);
+    assertThat('a disabled extension stays disabled after a reload',
+        afterReload.registered === false && afterReload.persisted === true,
+        JSON.stringify(afterReload));
+
+    const reenabled = await cdp.evaluate(`await window.LoomUI.setExtensionEnabled('hello-loom', true);
+        await new Promise(resolve => setTimeout(resolve, 300));
+        const call = await window.Loom.executeCapability('hello-loom', 'hello.greet', { name: 'Reload' });
+        return {
+            state: window.Loom.getExtensionState('hello-loom')?.state ?? null,
+            persisted: (window.Loom.getState('loom-ui', 'disabledExtensions') ?? []).includes('hello-loom'),
+            call: call.success,
+        };`);
+    assertThat('enabling brings the extension back and it works',
+        reenabled.state === 'active' && reenabled.persisted === false && reenabled.call === true,
+        JSON.stringify(reenabled));
+
+    const reloaded = await cdp.evaluate(`await window.LoomUI.reloadExtension('hello-loom');
+        await new Promise(resolve => setTimeout(resolve, 300));
+        return {
+            state: window.Loom.getExtensionState('hello-loom')?.state ?? null,
+            calls: window.Loom.listCapabilities('hello-loom').length,
+        };`);
+    assertThat('reloading re-registers the extension', reloaded.state === 'active' && reloaded.calls === 1,
+        JSON.stringify(reloaded));
+}
+
+const SCRIPT_SOURCE = `export default {
+    activate({ id }) {
+        globalThis.Loom.registerCapability(id, {
+            id: 'verify.echo',
+            name: 'Echo',
+            input: { type: 'object', required: ['value'], properties: { value: { type: 'string', minLength: 1 } }, additionalProperties: false },
+            output: { type: 'string' },
+            execute: input => input.value.toUpperCase(),
+        });
+    },
+};`;
+
+async function probeScripts(cdp) {
+    await cdp.waitFor("return window.LoomUI?.isReady?.() === true;", SETTLE_TIMEOUT_MS, 'installer boot before scripts');
+    // Earlier runs may have left a probe script behind; remove only our own ids.
+    await cdp.evaluate(`for (const script of (window.Loom.getState('loom-ui', 'scripts') ?? [])) {
+        if (script.id.startsWith('script-verify')) await window.LoomUI.deleteScript(script.id);
+    }`);
+    const saved = await cdp.evaluate(`const id = await window.LoomUI.saveScript('verify script', ${JSON.stringify(SCRIPT_SOURCE)});
+        const call = await window.Loom.executeCapability(id, 'verify.echo', { value: 'hi' });
+        return { id, call, list: window.LoomUI.listScripts() };`);
+    assertThat('a pasted script runs and registers a capability',
+        typeof saved.id === 'string' && saved.call.success === true && saved.call.data === 'HI'
+        && saved.list.some(script => script.id === saved.id),
+        JSON.stringify(saved));
+
+    // Extension state persists through SillyTavern's debounced settings save.
+    await cdp.evaluate('await new Promise(resolve => setTimeout(resolve, 2000)); return true;');
+    await cdp.send('Page.navigate', { url: ST_URL });
+    await cdp.waitFor("return Boolean(window.Loom && window.LoomUI);", READY_TIMEOUT_MS, 'boot after script save');
+    // Boot re-runs saved scripts after loading the package index; wait for it.
+    const scriptBoot = await (async () => {
+        const deadline = Date.now() + SETTLE_TIMEOUT_MS;
+        while (Date.now() < deadline) {
+            const state = await cdp.evaluate(`const script = window.LoomUI.listScripts().find(item => item.id === ${JSON.stringify(saved.id)});
+                const current = window.Loom?.getExtensionState(${JSON.stringify(saved.id)});
+                return {
+                    listed: Boolean(script),
+                    state: current?.state ?? null,
+                    problems: window.LoomUI.getInstallProblems(),
+                    scripts: (window.Loom.getState('loom-ui', 'scripts') ?? []).map(item => item.id),
+                };`);
+            if (state?.state === 'active') return state;
+            await sleep(300);
+        }
+        return null;
+    })();
+    assertThat('the script is still remembered after a reload',
+        Boolean(scriptBoot) && scriptBoot.listed === true, JSON.stringify(scriptBoot));
+    const restored = scriptBoot?.state === 'active'
+        ? await cdp.evaluate(`return await window.Loom.executeCapability(${JSON.stringify(saved.id)}, 'verify.echo', { value: 'again' });`)
+        : { success: false };
+    assertThat('a saved script runs again after a reload',
+        scriptBoot?.state === 'active' && restored.success === true && restored.data === 'AGAIN',
+        JSON.stringify({ scriptBoot, restored }));
+
+    const removed = await cdp.evaluate(`await window.LoomUI.deleteScript(${JSON.stringify(saved.id)});
+        return {
+            listed: window.LoomUI.listScripts().some(script => script.id === ${JSON.stringify(saved.id)}),
+            registered: window.Loom.listExtensions().some(entry => entry.id === ${JSON.stringify(saved.id)}),
+        };`);
+    assertThat('deleting a script unloads it and forgets it',
+        removed.listed === false && removed.registered === false, JSON.stringify(removed));
+}
+
+async function probeMobileLayout(cdp) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: 390, height: 844, deviceScaleFactor: 2, mobile: true,
+    });
+    try {
+        await cdp.evaluate('await new Promise(resolve => setTimeout(resolve, 400)); return true;');
+        const baseline = await cdp.evaluate('return { scrollWidth: document.documentElement.scrollWidth, innerWidth: window.innerWidth };');
+        const mobile = await cdp.evaluate(`document.getElementById('loom_extension_button')?.click();
+            document.getElementById('loom_wbm_button')?.click();
+            await new Promise(resolve => setTimeout(resolve, 500));
+            const viewport = await window.Loom.executeCapability('loom-host', 'viewport.get', null, { caller: 'loom-ui' });
+            const panel = document.getElementById('loom_panel');
+            const manager = document.getElementById('loom_wbm_panel');
+            const toggle = document.querySelector('#loom_permissions button');
+            const rect = element => element ? element.getBoundingClientRect() : null;
+            const panelRect = rect(panel);
+            const managerRect = rect(manager);
+            const toggleRect = rect(toggle);
+            const offenders = [...document.querySelectorAll('#loom_panel *, #loom_wbm_panel *, #loom_consent *')]
+                .filter(node => rect(node) && rect(node).right > window.innerWidth + 1)
+                .slice(0, 3)
+                .map(node => (node.id || node.className || node.tagName) + '@' + Math.round(rect(node).right));
+            return {
+                isMobile: viewport.data?.isMobile ?? null,
+                scrollWidth: document.documentElement.scrollWidth,
+                innerWidth: window.innerWidth,
+                panelWidth: Math.round(panelRect?.width ?? 0),
+                managerWidth: Math.round(managerRect?.width ?? 0),
+                managerLeft: Math.round(managerRect?.left ?? 0),
+                toggleHeight: Math.round(toggleRect?.height ?? 0),
+                offenders,
+            };`);
+        assertThat('the viewport reports a mobile width', mobile.isMobile === true, JSON.stringify(mobile));
+        assertThat('Loom does not add horizontal overflow at 390px',
+            mobile.scrollWidth <= Math.max(baseline.scrollWidth, mobile.innerWidth)
+            && mobile.panelWidth <= mobile.innerWidth && (mobile.offenders ?? []).length === 0,
+            JSON.stringify({ mobile, baseline }));
+        assertThat('the manager panel fits the phone viewport',
+            mobile.managerWidth > 0 && mobile.managerWidth <= 390 && mobile.managerLeft >= 0,
+            JSON.stringify(mobile));
+        assertThat('tap targets stay usable on a narrow screen', mobile.toggleHeight <= 60, JSON.stringify(mobile));
+    } finally {
+        await cdp.send('Emulation.clearDeviceMetricsOverride');
+    }
+}
+
 async function probeReloadRestore(cdp) {
     const before = await cdp.evaluate(`return {
         loomUi: window.Loom.checkPermission('loom-ui', 'host.settings.write'),
@@ -1763,9 +1953,21 @@ async function cleanup(cdp) {
         // longer registered, so revokePermission() would throw and abort the
         // rest of the cleanup, leaving test grants behind.
         await cdp.evaluate(`const settings = window.SillyTavern.getContext().extensionSettings;
+            // Undo the feature-level state this run may have written: a disabled
+            // package left behind would change the next run's starting point.
+            const disabled = window.Loom?.getState('loom-ui', 'disabledExtensions') ?? [];
+            for (const id of disabled) {
+                try { await window.LoomUI?.setExtensionEnabled?.(id, true); } catch { /* not installed any more */ }
+            }
+            for (const script of (window.Loom?.getState('loom-ui', 'scripts') ?? [])) {
+                try { await window.LoomUI?.deleteScript?.(script.id); } catch { /* already gone */ }
+            }
             for (const id of ['verify-probe', 'verify-state', 'verify-imported', 'verify-lifecycle']) {
                 if (window.Loom?.listExtensions().some(entry => entry.id === id)) window.Loom.unregisterExtension(id);
             }
+            // Clear this extension's own bookkeeping so a rerun starts clean.
+            const root = settings.__loom;
+            if (root?.state?.['loom-ui']) delete root.state['loom-ui'];
             if (settings.__loom) delete settings.__loom;
             window.SillyTavern.getContext().saveSettingsDebounced();
             return true;`);
@@ -1782,9 +1984,12 @@ async function cleanup(cdp) {
                 grants: root.grants ?? [],
                 stateKeys: Object.keys(root.state ?? {}),
                 installed: root.state?.['loom-ui']?.installedExtensions ?? [],
+                disabled: root.state?.['loom-ui']?.disabledExtensions ?? [],
+                scripts: root.state?.['loom-ui']?.scripts ?? [],
             };`);
         const probeState = remaining.stateKeys.filter(key => /^verify-/.test(key));
-        if (remaining.grants.length > 0 || probeState.length > 0 || remaining.installed.length > 0) {
+        if (remaining.grants.length > 0 || probeState.length > 0 || remaining.installed.length > 0
+            || remaining.disabled.length > 0 || remaining.scripts.length > 0) {
             record('cleanup removed the test grants', false, JSON.stringify(remaining));
         } else {
             record('cleanup removed the test grants', true, `bundled state kept: ${remaining.stateKeys.join(', ') || 'none'}`);
@@ -1847,6 +2052,9 @@ async function main() {
         await runProbe('card lifecycle', probeCardLifecycle, cdp);
         await runProbe('chat mutation', probeChatMutation, cdp);
         await runProbe('reload restore', probeReloadRestore, cdp);
+        await runProbe('extension management', probeExtensionManagement, cdp);
+        await runProbe('scripts', probeScripts, cdp);
+        await runProbe('mobile layout', probeMobileLayout, cdp);
 
         const loomErrors = consoleErrors.filter(message => /loom/i.test(message));
         assertThat('no Loom-related console errors', loomErrors.length === 0, loomErrors.join(' | '));

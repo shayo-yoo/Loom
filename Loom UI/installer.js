@@ -111,7 +111,29 @@ export function describeInstalled(installed, states) {
             bundled: Boolean(entry.bundled),
             state: state?.state ?? (entry.id ? 'missing' : 'unknown'),
             name: state?.name ?? entry.id ?? entry.entry,
+            version: entry.version ?? state?.version ?? '',
+            permissions: Array.isArray(entry.permissions) ? entry.permissions : [],
+            dependencies: Array.isArray(entry.dependencies) ? entry.dependencies : [],
             error: state?.error?.message ?? '',
         };
     });
+}
+
+/** Slug used for generated script ids; keeps Core's id pattern. */
+export function scriptSlug(name) {
+    const base = String(name ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    return base || 'script';
+}
+
+/** Pick a script id that does not collide with the existing ones. */
+export function scriptIdFor(name, existingIds = []) {
+    const taken = new Set(existingIds);
+    const base = `script-${scriptSlug(name)}`.slice(0, 48);
+    let candidate = base;
+    let suffix = 2;
+    while (taken.has(candidate)) {
+        candidate = `${base}-${suffix}`;
+        suffix += 1;
+    }
+    return candidate;
 }

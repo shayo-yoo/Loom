@@ -24,6 +24,50 @@
     justify-content: center;
 }
 
+/* Installer / script rows */
+.loom_installer_controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin: 6px 0;
+}
+
+.loom_installer_controls input {
+    flex: 1 1 160px;
+    min-width: 0;
+}
+
+.loom_install_row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, #555);
+}
+
+.loom_install_main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1 1 160px;
+}
+
+.loom_install_error {
+    color: var(--SmartThemeErrorColor, #e06c75);
+    font-size: 0.9em;
+    overflow-wrap: anywhere;
+}
+
+.loom_hint {
+    color: var(--SmartThemeEmColor, #aaa);
+    font-size: 0.85em;
+    overflow-wrap: anywhere;
+}
+
 .loom_panel {
     position: fixed;
     z-index: 10000;

@@ -181,15 +181,26 @@ All host capabilities return mapped primitives rather than host objects. When Si
 
 A Loom extension package is a directory `extensions/<id>/` with `manifest.json` (`id`/`name`/`version`/`entry`, optional `dependencies`/`permissions`) and the entry module. `npm run extensions:index` writes the deterministic `extensions/index.json` that the browser reads.
 
-`globalThis.LoomUI` exposes installation:
+`globalThis.LoomUI` exposes installation and management:
 
 - `installExtension(url)` → resolves `url` against Loom's root (or accepts an absolute URL), imports the module through Core's `importExtension`, remembers `{ id, entry }` in `loom-ui`'s persisted state, and returns the entry URL. A failed import rejects with the Core message and leaves no record.
 - `uninstallExtension(idOrEntry)` → unloads the extension (if registered) and forgets the record.
-- `getInstalledExtensions()` → `[{ id, entry, bundled, state, name, error }]` for bundled and manually installed packages, with the runtime state or `missing` when nothing is registered.
+- `setExtensionEnabled(id, enabled)` → disabling unloads the extension and remembers the id in `disabledExtensions`; enabling clears the record and re-imports from the package source. Both persist under `loom-ui` state, and boot skips disabled packages.
+- `reloadExtension(id)` → unloads and re-imports from the package source; a manual install gets a `loomReload` query parameter because an imported module cannot be evicted from the browser's module map.
+- `getInstalledExtensions()` → `[{ id, entry, bundled, state, name, version, permissions, dependencies, error }]` for bundled and manually installed packages, with the runtime state (or `missing`) and the declared metadata.
+- `isReady()` → whether boot finished loading the index, packages and scripts.
+- `getInstallProblems()` → the messages collected from failed imports and script runs.
+
+Scripts are the lightweight package form:
+
+- `saveScript(name, source)` → generates an id (`script-<slug>`, collision-suffixed), imports the source through a Blob URL with that identity, and keeps `{ id, name, source }` in `loom-ui` state; saved scripts re-run on boot. Returns the id.
+- `updateScript(id, source)` / `deleteScript(id)` / `listScripts()` complete the lifecycle.
+- The module default export only needs hooks (`activate`/`deactivate`); identity, permissions and error attribution come from Loom. `saveScript` rejects if the import fails, so a broken script is not stored.
+- There is no sandbox: this is a local loader with the same trust boundary as an extension.
 
 `importExtension(entryUrl, options)` merges `options.manifest` (a package's `manifest.json`) with the module's exported manifest: the explicit manifest wins field by field, but `activate`/`deactivate` come from code when the JSON manifest has none. A package therefore keeps identity in JSON and behaviour in code.
 
-Bundled packages load on every boot; a missing `extensions/index.json` is not an error. Manually installed URLs are re-imported on the next boot; a failed import is shown in the panel with its error and keeps its record until removed.
+Bundled packages load on every boot unless disabled; a missing `extensions/index.json` is not an error. Manually installed URLs and scripts are re-imported on the next boot; a failed import is shown in the panel with its error and keeps its record until removed.
 
 ## Built-in Host Events (`loom-host`)
 

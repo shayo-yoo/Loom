@@ -142,31 +142,56 @@ const view = globalThis.LoomUI.createView(id, {
 - 事件处理器的参数是 `{ event, payload, path, viewId, extensionId }`；`select`/`input`/`textarea`/`toggle` 的 `change` 把新值放在 `payload` 里（如 `payload.value`）。
 - 没有 `setRoot` 之外的大范围更新手段：状态驱动时重建整棵树最简单；重建会让输入框失焦，所以只在 `change`（失焦后）触发重建。
 
-## 6. 安装与调试
+## 6. 脚本：一个文件就够了
 
-1. 把目录放进 `extensions/<id>/`。
-2. 运行 `npm run extensions:index`（浏览器无法列目录，需要生成的索引）。
-3. 刷新 SillyTavern 页面；面板「扩展安装」区会出现它，状态为 `active`。
+不是每个小功能都值得建扩展目录。面板「脚本」区可以直接粘贴一个 ES 模块并运行：不需要 `manifest.json`、不需要目录、不需要跑索引。
+
+```js
+export default {
+    activate({ id }) {
+        globalThis.Loom.registerCapability(id, {
+            id: 'my.tool',
+            name: 'My tool',
+            input: { type: 'object', required: ['text'], properties: { text: { type: 'string' } }, additionalProperties: false },
+            output: { type: 'string' },
+            execute: input => input.text.trim(),
+        });
+    },
+};
+```
+
+- 身份（`script-<名称>`）由 Loom 生成，脚本只写钩子；能力、权限、状态、错误、卸载都按普通扩展处理。
+- 脚本保存在 Loom 的持久状态里，刷新页面后自动重新运行；删除脚本会卸载它。
+- 修改源码后点「重新运行」即可（脚本使用内存中的源码，不需要刷新页面）。
+- 脚本不是沙箱：它是本地加载器，信任边界与扩展相同——不要用它运行来源不明的代码。
+
+## 7. 安装、启用与重载
+
+1. 扩展：把目录放进 `extensions/<id>/`，运行 `npm run extensions:index`。
+2. 刷新酒馆页面；面板「扩展安装」区会列出它，状态 `active`。
+3. 每行可以 **停用/启用**（停用会卸载扩展并记住选择，刷新后仍然停用）、**重新加载**（修改代码后重新导入；手动安装的模块会带缓存参数，确保读到新文件）、**移除**（仅手动安装的扩展）。
 
 手动安装（不放进仓库）：在面板输入模块地址（相对 Loom 根目录或绝对 URL），安装记录会持久化，刷新后自动恢复。
 
-调试：
+## 8. 调试
 
 - 面板「扩展」列表显示每个扩展的状态与错误信息；
+- 「安装问题」区显示导入/脚本失败的原因；
 - `globalThis.Loom.getExtensionState('<id>')` 读取状态与最后错误；
+- `globalThis.LoomUI.isReady()` 判断安装器是否已完成启动（索引与脚本已加载）；
 - 单元测试放在相邻的 `*.test.js`，`npm test` 无需浏览器；
-- 端到端验证用 `npm run verify:browser`（需要酒馆在 8100 运行）。**验证脚本只能修改自己创建的临时数据**。
+- 端到端验证用 `npm run verify:browser`（需要酒馆在 8100 运行），并可用 `Emulation` 模拟窄视口。**验证脚本只能修改自己创建的临时数据**。
 
-## 7. 完整例子
+## 9. 完整例子
 
-`extensions/hello-loom/` 是最小可用包；`extensions/world-book-manager/` 演示了权限申请、宿主读写、LoomUI 界面与错误处理。两者的 `manifest.json` 与 `index.js` 都可以直接复制改写。
+`extensions/hello-loom/` 是最小可用包；`extensions/world-book-manager/` 演示了权限申请、宿主读写、LoomUI 界面、分页/搜索与错误处理。两者的 `manifest.json` 与 `index.js` 都可以直接复制改写。
 
 世界书管理器的两个容易踩的点，也写在代码注释里：
 
 - **读完整内容要用 `worlds.export`**：`worlds.entries` 为展示会把内容截断到 2000 字，拿截断内容回写会毁数据。
 - **`worlds.entry.update` 的 `uid` 是字符串**（`worlds.entry.create` 返回的也是字符串），传数字会得到 `INVALID_INPUT`。
 
-## 8. 常见错误
+## 10. 常见错误
 
 | 现象 | 原因 |
 |---|---|
