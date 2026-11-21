@@ -121,11 +121,11 @@ Whole-book lifecycle (destructive, hence a separate permission):
 
 `chat.append` writes one **system message** into the open chat:
 
-- `type` is an allowlist (`narrator` default, `comment`, `generic`) mapped onto SillyTavern's own `sendSystemMessage`, because that is the only stable writing function the host exposes; fabricating a chat entry would bypass its rendering and bookkeeping. Unknown types fail with `INVALID_INPUT`; `text` is 1–4000 characters.
+- `type` is an allowlist of the types **the host actually defines a template for**: `generic` (default) and `assistant_note`. SillyTavern 1.19 lists `narrator` and `comment` in its type enum but has no template for them, so `sendSystemMessage` returns `undefined`, pushes it into the chat and throws while rendering — those types are rejected up front with `INVALID_INPUT` instead of shipping a default that always fails. Unknown types fail with `INVALID_INPUT`; `text` is 1–4000 characters.
 - A chat must be open: no chat id and an empty chat buffers to `NO_CHAT` instead of writing nowhere.
 - `sendSystemMessage` renders but does not save, so the handler calls `saveChat?.()` afterwards; a message that is not persisted would silently disappear on the next reload.
 - **Rollback is mandatory.** SillyTavern pushes the message *before* rendering it, so a render failure (or an unsupported type on some builds) can leave a half-written entry. The handler catches the throw, pops everything it added, and reports `HOST_UNSUPPORTED`. A failed append never mutates the chat.
-- Known host hazard: when the current chat already contains a malformed entry, SillyTavern's own rendering path can throw `Cannot read properties of undefined (reading 'is_user')`. That is recorded rather than worked around — the capability reports it and leaves the chat untouched. The same error appears in an environment without a selected persona (system messages name the character), which is why the browser harness verifies edit/delete independently of append.
+- Known host hazard (fixed for the default type): when the current chat already contains a malformed entry, SillyTavern's own rendering path can throw `Cannot read properties of undefined (reading 'is_user')`. The handler rolls that back and reports it. The earlier `narrator`/`comment` types failed *unconditionally* on this host version because they have no template; that is why the allowlist now follows the templates. The same `is_user` message can also appear in an environment without a selected persona, which is why the browser harness verifies append/edit/delete on a scratch character's chat rather than the user's.
 
 `chat.edit` changes an existing message's text:
 

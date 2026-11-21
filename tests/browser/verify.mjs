@@ -942,45 +942,28 @@ async function probeStatePersistence(cdp) {
 }
 
 async function probeChatWrite(cdp) {
-    // The permission gate and the failure branches are verifiable headlessly.
-    // A real append needs an open chat, which this harness does not create: it
-    // must not write into the user's current chat. That boundary is reported.
+    // Gate checks only. A real append is destructive to whichever chat is open,
+    // and this harness must never write into the user's chat: the real write path
+    // is exercised on a scratch character's chat in `probeChatMutation`.
     const denied = await cdp.evaluate(`const Loom = window.Loom;
         if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) {
             Loom.loadExtension({ id: 'verify-probe', name: 'Verify Probe' });
         }
         if (Loom.checkPermission('verify-probe', 'host.chat.write')) Loom.revokePermission('verify-probe', 'host.chat.write');
-        return await Loom.executeCapability('loom-host', 'chat.append', { text: 'blocked' }, { caller: 'verify-probe' });`);
-    assertThat('chat.append is denied without host.chat.write',
-        denied.success === false && denied.error.code === 'PERMISSION_DENIED', denied.error?.code ?? 'no error');
-
-    const granted = await cdp.evaluate(`const Loom = window.Loom;
-        Loom.requestPermission('verify-probe', 'host.chat.write', { reason: '验证用' });
-        const pending = Loom.listPermissionRequests().find(entry => entry.extensionId === 'verify-probe');
-        if (pending) Loom.resolvePermissionRequest(pending.id, { approved: true });
         const context = window.SillyTavern.getContext();
         const lengthBefore = Array.isArray(context.chat) ? context.chat.length : -1;
-        const result = await Loom.executeCapability('loom-host', 'chat.append', { text: 'hello chat' }, { caller: 'verify-probe' });
+        const result = await Loom.executeCapability('loom-host', 'chat.append', { text: 'blocked' }, { caller: 'verify-probe' });
         const lengthAfter = Array.isArray(context.chat) ? context.chat.length : -1;
-        return { result, lengthBefore, lengthAfter, chatId: context.getCurrentChatId?.() ?? null, hasWriter: typeof context.sendSystemMessage === 'function' };`);
-    assertThat('the host exposes a system-message writer', granted.hasWriter === true);
-    if (granted.result.success === true) {
-        assertThat('chat.append writes into the open chat',
-            granted.result.data?.appended === true && granted.lengthAfter === granted.lengthBefore + 1,
-            JSON.stringify(granted));
-    } else if (granted.result.error?.code === 'NO_CHAT') {
-        assertThat('chat.append reports NO_CHAT instead of writing nowhere', true);
-        record('chat.append real write path', true,
-            'not exercised: no chat open in the headless session (no user data touched)');
-    } else {
-        // The host refused its own writer in this environment; the important part
-        // is that nothing was left behind in the chat.
-        assertThat('a failed chat.append leaves the chat unchanged',
-            granted.lengthAfter === granted.lengthBefore,
-            `before=${granted.lengthBefore}, after=${granted.lengthAfter}, error=${granted.result.error?.code}`);
-        record('chat.append real write path', true,
-            `not exercised: host rejected the write (${granted.result.error?.message ?? 'unknown'}); chat unchanged`);
-    }
+        return { result, lengthBefore, lengthAfter, hasWriter: typeof context.sendSystemMessage === 'function' };`);
+    assertThat('chat.append is denied without host.chat.write',
+        denied.result.success === false && denied.result.error.code === 'PERMISSION_DENIED',
+        denied.result.error?.code ?? 'no error');
+    assertThat('a denied chat.append leaves the open chat untouched',
+        denied.lengthAfter === denied.lengthBefore,
+        `before=${denied.lengthBefore}, after=${denied.lengthAfter}`);
+    assertThat('the host exposes a system-message writer', denied.hasWriter === true);
+    record('chat.append real write path', true,
+        'verified on the scratch chat in the chat-mutation probe (the user chat is never written)');
 }
 
 async function probeChatMutation(cdp) {
@@ -991,6 +974,14 @@ async function probeChatMutation(cdp) {
     let created = null;
     let chatsDir = null;
     try {
+        await cdp.evaluate(`const Loom = window.Loom;
+            if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) {
+                Loom.loadExtension({ id: 'verify-probe', name: 'Verify Probe' });
+            }
+            if (!Loom.checkPermission('verify-probe', 'host.chat.write')) {
+                Loom.grantPermission('verify-probe', 'host.chat.write');
+            }
+            return true;`);
         created = await cdp.evaluate(`const context = window.SillyTavern.getContext();
             const response = await fetch('/api/characters/create', {
                 method: 'POST',
@@ -1028,6 +1019,22 @@ async function probeChatMutation(cdp) {
 
         const mutated = await cdp.evaluate(`const Loom = window.Loom;
             const context = window.SillyTavern.getContext();
+            // Append with the default type first: this is the path that used to be
+            // broken because the default type had no host template.
+            const appended = await Loom.executeCapability('loom-host', 'chat.append',
+                { text: 'append probe' }, { caller: 'verify-probe' });
+            const appendedIndex = appended.data?.index ?? -1;
+            const appendedText = String(context.chat[appendedIndex]?.mes ?? '');
+            const editedAppended = appended.success
+                ? await Loom.executeCapability('loom-host', 'chat.edit',
+                    { index: appendedIndex, text: 'edited append' }, { caller: 'verify-probe' })
+                : null;
+            const deletedAppended = appended.success
+                ? await Loom.executeCapability('loom-host', 'chat.delete',
+                    { index: appendedIndex, expect: 'edited append' }, { caller: 'verify-probe' })
+                : null;
+            const lengthAfterAppendCycle = context.chat.length;
+
             const edited = await Loom.executeCapability('loom-host', 'chat.edit',
                 { index: 0, text: 'edited greeting' }, { caller: 'verify-probe' });
             const afterEdit = String(context.chat[0]?.mes ?? '');
@@ -1037,7 +1044,20 @@ async function probeChatMutation(cdp) {
                 { index: 0, expect: 'stale text' }, { caller: 'verify-probe' });
             const deleted = await Loom.executeCapability('loom-host', 'chat.delete',
                 { index: 0, expect: 'edited greeting' }, { caller: 'verify-probe' });
-            return { edited, afterEdit, outOfRange, refused, deleted, lengthAfter: context.chat.length };`, 30_000);
+            return {
+                appended, appendedText, editedAppended, deletedAppended, lengthAfterAppendCycle,
+                edited, afterEdit, outOfRange, refused, deleted, lengthAfter: context.chat.length,
+            };`, 30_000);
+        assertThat('chat.append writes a system message with its default type',
+            mutated.appended.success === true
+            && mutated.appended.data.type === 'generic'
+            && mutated.appendedText === 'append probe',
+            JSON.stringify({ appended: mutated.appended, text: mutated.appendedText }));
+        assertThat('the appended message can be edited and deleted again',
+            mutated.editedAppended?.success === true
+            && mutated.deletedAppended?.success === true
+            && mutated.lengthAfterAppendCycle === 1,
+            JSON.stringify({ edited: mutated.editedAppended, deleted: mutated.deletedAppended, length: mutated.lengthAfterAppendCycle }));
         assertThat('chat.edit rewrites the message text',
             mutated.edited.success === true && mutated.afterEdit === 'edited greeting',
             JSON.stringify({ edited: mutated.edited, afterEdit: mutated.afterEdit }));

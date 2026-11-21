@@ -1,7 +1,7 @@
 import '../Loom%20Core/index.js';
 
 const EXTENSION_ID = 'loom-host';
-const HOST_VERSION = '0.24.0';
+const HOST_VERSION = '0.25.0';
 const runtime = globalThis.Loom;
 
 const nullInput = { type: 'null' };
@@ -1462,21 +1462,29 @@ const settingsListCapability = {
  *
  * Only SillyTavern's own system-message types are used, because they are the one
  * writing path the host exposes as a stable function (`sendSystemMessage`); a
- * fabricated chat entry would bypass its rendering and bookkeeping. The type
- * allowlist is deliberately narrow: `narrator` for prose the reader should see,
- * `comment` for out-of-character notes, `generic` as a fallback.
+ * fabricated chat entry would bypass its rendering and bookkeeping.
  *
  * If the host rejects the type (unknown type pushes nothing, or pushes an empty
  * entry on some builds), the damage is undone by popping what was added and the
  * call fails with `HOST_UNSUPPORTED` instead of leaving a corrupt chat.
  */
-const CHAT_MESSAGE_TYPES = Object.freeze(['narrator', 'comment', 'generic']);
+/**
+ * Only types that SillyTavern 1.19 actually defines in `system_messages`.
+ *
+ * `narrator` and `comment` exist in the host's type enum but have **no template**
+ * in this version: `sendSystemMessage` then returns `undefined`, pushes it into
+ * the chat and throws while rendering. Offering them would mean shipping a
+ * default that always fails, so the allowlist follows the templates, not the
+ * enum, and `generic` is the default (it always has a template).
+ */
+const CHAT_MESSAGE_TYPES = Object.freeze(['generic', 'assistant_note']);
+const DEFAULT_CHAT_MESSAGE_TYPE = 'generic';
 const CHAT_TEXT_LIMIT = 4000;
 
 const chatAppendCapability = {
     id: 'chat.append',
     name: '写入聊天消息',
-    description: '向当前聊天追加一条系统消息（narrator / comment / generic）；需要 host.chat.write 授权。',
+    description: '向当前聊天追加一条系统消息（generic / assistant_note，默认 generic）；需要 host.chat.write 授权。',
     permissions: ['host.chat.write'],
     input: {
         type: 'object',
@@ -1508,7 +1516,7 @@ const chatAppendCapability = {
             throw typedError('NO_CHAT', 'No chat is open; open a chat before appending a message.');
         }
 
-        const type = input.type ?? 'narrator';
+        const type = input.type ?? DEFAULT_CHAT_MESSAGE_TYPE;
         const before = Array.isArray(chat) ? chat.length : 0;
         const undo = () => {
             while (Array.isArray(context.chat) && context.chat.length > before) context.chat.pop();

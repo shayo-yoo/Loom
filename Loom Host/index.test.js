@@ -1078,8 +1078,9 @@ test('appends a system message to the chat and saves it', async () => {
     grantPermission(consumerId, 'host.chat.write');
 
     const result = await executeCapability(EXTENSION_ID, 'chat.append', { text: '注意：世界书已更新' }, { caller: consumerId });
-    assert.deepEqual(result, { success: true, data: { appended: true, type: 'narrator', index: 1 } });
-    assert.deepEqual(host.appended, [{ type: 'narrator', text: '注意：世界书已更新' }]);
+    assert.deepEqual(result, { success: true, data: { appended: true, type: 'generic', index: 1 } },
+        'the default type is one the host actually defines');
+    assert.deepEqual(host.appended, [{ type: 'generic', text: '注意：世界书已更新' }]);
     assert.equal(host.chat.length, 2);
     assert.equal(host.saved(), 1, 'the message is persisted, not only rendered');
 });
@@ -1196,6 +1197,10 @@ test('chat.append rejects unknown message types and oversized text', async () =>
 
     const badType = await executeCapability(EXTENSION_ID, 'chat.append', { text: 'x', type: 'html' }, { caller: consumerId });
     assert.equal(badType.error.code, 'INVALID_INPUT');
+    // Types that exist in the host's enum but have no template are refused up
+    // front instead of pushing `undefined` into the chat.
+    const narrator = await executeCapability(EXTENSION_ID, 'chat.append', { text: 'x', type: 'narrator' }, { caller: consumerId });
+    assert.equal(narrator.error.code, 'INVALID_INPUT', 'narrator has no template in SillyTavern 1.19');
     const tooLong = await executeCapability(EXTENSION_ID, 'chat.append', { text: 'x'.repeat(4001) }, { caller: consumerId });
     assert.equal(tooLong.error.code, 'INVALID_INPUT');
     assert.deepEqual(host.appended, []);
@@ -1203,7 +1208,7 @@ test('chat.append rejects unknown message types and oversized text', async () =>
 
 test('chat.append rolls back when the host rejects the message', async () => {
     // Some builds push an empty entry for an unsupported type.
-    const host = stubChatHost({ chat: [{ name: 'A', mes: 'hi' }], rejectType: 'narrator', pushUndefined: true });
+    const host = stubChatHost({ chat: [{ name: 'A', mes: 'hi' }], rejectType: 'generic', pushUndefined: true });
     registerConsumer();
     grantPermission(consumerId, 'host.chat.write');
 
