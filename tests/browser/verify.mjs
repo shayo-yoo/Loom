@@ -979,6 +979,7 @@ async function probeChatWrite(cdp) {
 }
 
 const CARD_SCRATCH = '__loom_verify_card_create__';
+const CARD_CHATS_DIR = path.join('D:\\1\\APP\\SillyTavern', 'data', 'default-user', 'chats', CARD_SCRATCH);
 
 async function probeCardLifecycle(cdp) {
     let created = null;
@@ -1026,8 +1027,12 @@ async function probeCardLifecycle(cdp) {
         assertThat('characters.remove deletes the card',
             removed.success === true && removed.data.removed === true, JSON.stringify(removed));
         assertThat('the card file is gone', existsSync(filePath) === false, filePath);
+        // Deleting a card keeps its conversation directory: the capability sends
+        // delete_chats: false, so the user's chats survive a library cleanup.
+        assertThat('the card deletion keeps its chat directory', existsSync(CARD_CHATS_DIR), CARD_CHATS_DIR);
         created = null;
     } finally {
+        await rm(CARD_CHATS_DIR, { recursive: true, force: true });
         if (created) {
             await cdp.evaluate(`const context = window.SillyTavern.getContext();
                 await fetch('/api/characters/delete', {
@@ -1036,8 +1041,6 @@ async function probeCardLifecycle(cdp) {
                     body: JSON.stringify({ avatar_url: ${JSON.stringify(created)}, delete_chats: false }),
                 });
                 return true;`);
-            await rm(path.join('D:\\1\\APP\\SillyTavern', 'data', 'default-user', 'chats', CARD_SCRATCH),
-                { recursive: true, force: true });
         }
     }
 }
