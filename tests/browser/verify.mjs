@@ -77,6 +77,7 @@ class Cdp {
     #ws;
     #nextId = 1;
     #pending = new Map();
+    #settingsSaves = 0;
 
     constructor(ws) {
         this.#ws = ws;
@@ -96,7 +97,28 @@ class Cdp {
             if (message.method === 'Runtime.exceptionThrown') {
                 consoleErrors.push(message.params.exceptionDetails.exception?.description ?? 'exception');
             }
+            // SillyTavern persists extension settings through a debounced save;
+            // observing the request is the only reliable "it is on disk" signal.
+            if (message.method === 'Network.requestWillBeSent'
+                && String(message.params.request?.url ?? '').includes('/api/settings/save')) {
+                this.#settingsSaves += 1;
+            }
         });
+    }
+
+    /** How many settings saves the page has issued since this session started. */
+    get settingsSaves() {
+        return this.#settingsSaves;
+    }
+
+    /** Wait for a settings save that started after `previousCount`. */
+    async waitForSettingsSave(previousCount, timeoutMs = 10_000) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            if (this.#settingsSaves > previousCount) return true;
+            await sleep(100);
+        }
+        return false;
     }
 
     static async connect(wsUrl) {
@@ -1417,6 +1439,7 @@ async function probeExtensionInstall(cdp) {
     assertThat('the panel has an install section listing the bundled extension', listed === true);
 
     // User install: a module URL is imported and remembered; a reload restores it.
+    const savesBeforeInstall = cdp.settingsSaves;
     const installed = await cdp.evaluate(`const source = 'data:text/javascript,${encodeURIComponent(
         'export default { id: "verify-installed", name: "Installed Probe" };',
     )}';
@@ -1429,8 +1452,9 @@ async function probeExtensionInstall(cdp) {
         && (installed.stored ?? []).some(item => item.id === 'verify-installed'),
         JSON.stringify(installed));
 
-    // Extension state persists through SillyTavern's debounced settings save.
-    await cdp.evaluate('await new Promise(resolve => setTimeout(resolve, 2000)); return true;');
+    // The install record is state: wait for the settings save before reloading.
+    const flushedInstall = await cdp.waitForSettingsSave(savesBeforeInstall, 10_000);
+    assertThat('the install record is flushed to host settings', flushedInstall === true);
     await cdp.send('Page.navigate', { url: ST_URL });
     await cdp.waitFor("return Boolean(document.getElementById('loom_installer'));", READY_TIMEOUT_MS, 'installer after reload');
     const restored = await cdp.waitFor(
@@ -1750,6 +1774,7 @@ async function probeExtensionManagement(cdp) {
     assertThat('the bundled extension starts active', active.state === 'active' && active.capabilities === 1,
         JSON.stringify(active));
 
+    const savesBeforeDisable = cdp.settingsSaves;
     const disabled = await cdp.evaluate(`await window.LoomUI.setExtensionEnabled('hello-loom', false);
         await new Promise(resolve => setTimeout(resolve, 200));
         return {
@@ -1763,9 +1788,10 @@ async function probeExtensionManagement(cdp) {
         && disabled.persisted === true && disabled.listed === true,
         JSON.stringify(disabled));
 
-    // The disabled choice must survive a page reload: the installer skips it on boot.
-    // Give SillyTavern's debounced settings save time to flush before navigating.
-    await cdp.evaluate('await new Promise(resolve => setTimeout(resolve, 4000)); return true;');
+    // The disabled choice must survive a page reload: the installer skips it on
+    // boot. Wait for the debounced settings save to actually happen.
+    const savedDisabled = await cdp.waitForSettingsSave(savesBeforeDisable, 10_000);
+    assertThat('the disabled choice is flushed to host settings', savedDisabled === true);
     await cdp.send('Page.navigate', { url: ST_URL });
     await cdp.waitFor("return Boolean(window.Loom && window.LoomUI);", READY_TIMEOUT_MS, 'boot after disable');
     await cdp.waitFor("return window.LoomUI?.isReady?.() === true;", SETTLE_TIMEOUT_MS, 'installer boot after reload');
@@ -1817,6 +1843,7 @@ async function probeScripts(cdp) {
     await cdp.evaluate(`for (const script of (window.Loom.getState('loom-ui', 'scripts') ?? [])) {
         if (script.id.startsWith('script-verify')) await window.LoomUI.deleteScript(script.id);
     }`);
+    const savesBeforeScript = cdp.settingsSaves;
     const saved = await cdp.evaluate(`const id = await window.LoomUI.saveScript('verify script', ${JSON.stringify(SCRIPT_SOURCE)});
         const call = await window.Loom.executeCapability(id, 'verify.echo', { value: 'hi' });
         return { id, call, list: window.LoomUI.listScripts() };`);
@@ -1825,8 +1852,9 @@ async function probeScripts(cdp) {
         && saved.list.some(script => script.id === saved.id),
         JSON.stringify(saved));
 
-    // Extension state persists through SillyTavern's debounced settings save.
-    await cdp.evaluate('await new Promise(resolve => setTimeout(resolve, 2000)); return true;');
+    // The script source is state: wait for the settings save before reloading.
+    const flushedScript = await cdp.waitForSettingsSave(savesBeforeScript, 10_000);
+    assertThat('the script source is flushed to host settings', flushedScript === true);
     await cdp.send('Page.navigate', { url: ST_URL });
     await cdp.waitFor("return Boolean(window.Loom && window.LoomUI);", READY_TIMEOUT_MS, 'boot after script save');
     // Boot re-runs saved scripts after loading the package index; wait for it.
@@ -2024,6 +2052,7 @@ async function main() {
         cdp = await Cdp.connect(page.webSocketDebuggerUrl);
         await cdp.send('Runtime.enable');
         await cdp.send('Page.enable');
+        await cdp.send('Network.enable');
 
         await cdp.send('Page.navigate', { url: ST_URL });
         await cdp.waitFor("return Boolean(window.Loom && window.Loom.getRuntimeInfo);", READY_TIMEOUT_MS, 'Loom runtime boot');
