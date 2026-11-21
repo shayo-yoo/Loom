@@ -13,9 +13,21 @@
 
 Deliver an initial Loom runtime and UI extension that can be discovered and enabled through SillyTavern, then iterate toward the framework requirements without embedding business-specific behavior in Core.
 
+## Increment Report Convention
+
+Every completed increment ends with a short status overview for the user, in this shape (keep it factual, no promises):
+
+1. **Current position**  - what Loom is right now, in one or two sentences (framework vs. usable product).
+2. **What an extension author can already do**  - concrete capabilities, permissions, and a plausible extension idea they enable.
+3. **What is still missing before real use**  - ordered gaps (P0 blocks use, P1 blocks real workflows, P2 polish) with a rough size.
+4. **Verification evidence**  - unit test count, browser check count, and what the browser harness actually touched.
+5. **Known limits / incidents**  - anything the user must know (data touched, unverified paths, environment limits).
+
+The summary is delivered in the conversation; the change record stays a technical document. If a session resumes without this history, reconstruct the summary from `PROJECT_STATE.md`, `API_INDEX.md` and the latest `CHG-*` files rather than guessing.
+
 ## Current Implementation
 
-- Core exposes a small in-memory extension/capability registry, JSON Schema subset validation for declared inputs/outputs, structured execution results, an extension-scoped event bus, per-extension state storage (optionally persisted), disposal hooks, and extension-scoped cleanup (runtime 0.19.0).
+- Core exposes a small in-memory extension/capability registry, JSON Schema subset validation for declared inputs/outputs, structured execution results, an extension-scoped event bus, per-extension state storage (optionally persisted), disposal hooks, and extension-scoped cleanup (runtime 0.25.0).
 - Core implements extension identity: `author + declaredId`, deterministic `contentHash` (FNV-1a 64), install pre-checks (`new` / `duplicate` / `conflict`), and identity-group conflict reporting.
 - Core implements capability permissions: capabilities declare the permissions their caller must hold, `executeCapability` takes an explicit `caller`, and Core enforces the grants centrally before the handler runs (`PERMISSION_DENIED` with `details.missing`). Grant/revoke/list/check are public API; grants are per extension and dropped on unregister.
 - Core exposes `setPermissionStore({ load, save })` so a host can persist the grant table. `Loom Host` installs one backed by SillyTavern settings (`extensionSettings.__loom.grants`), so consent survives a reload; pending grants apply when their extension registers, making boot order irrelevant.
