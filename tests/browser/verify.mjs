@@ -978,6 +978,70 @@ async function probeChatWrite(cdp) {
         'verified on the scratch chat in the chat-mutation probe (the user chat is never written)');
 }
 
+const CARD_SCRATCH = '__loom_verify_card_create__';
+
+async function probeCardLifecycle(cdp) {
+    let created = null;
+    try {
+        const setup = await cdp.evaluate(`const Loom = window.Loom;
+            if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) {
+                Loom.registerExtension({ id: 'verify-probe', name: 'Verify Probe' });
+            }
+            if (!Loom.checkPermission('verify-probe', 'host.characters.manage')) {
+                Loom.grantPermission('verify-probe', 'host.characters.manage');
+            }
+            const result = await Loom.executeCapability('loom-host', 'characters.create', {
+                name: ${JSON.stringify(CARD_SCRATCH)},
+                fields: { description: 'created by the harness', firstMessage: 'hello there' },
+            }, { caller: 'verify-probe' });
+            const duplicate = await Loom.executeCapability('loom-host', 'characters.create', {
+                name: ${JSON.stringify(CARD_SCRATCH)},
+            }, { caller: 'verify-probe' });
+            return { result, duplicate };`);
+        assertThat('characters.create writes a new card',
+            setup.result.success === true && setup.result.data.created === true
+            && typeof setup.result.data.avatar === 'string',
+            JSON.stringify(setup.result));
+        assertThat('a duplicate card name is refused',
+            setup.duplicate.success === false && setup.duplicate.error.code === 'CHARACTER_EXISTS',
+            JSON.stringify(setup.duplicate.error));
+        if (setup.result.success !== true) return;
+        created = setup.result.data.avatar;
+
+        const filePath = path.join(CHARACTERS_DIR, created);
+        assertThat('the new card exists as a PNG on disk', existsSync(filePath), filePath);
+        const listed = await cdp.evaluate(`const Loom = window.Loom;
+            const result = await Loom.executeCapability('loom-host', 'characters.list', null, { caller: 'verify-probe' });
+            return result.data.some(item => item.avatar === ${JSON.stringify(created)});`);
+        assertThat('the new card is listed by the host', listed === true);
+
+        const guarded = await cdp.evaluate(`return await window.Loom.executeCapability('loom-host', 'characters.remove',
+            { avatar: ${JSON.stringify(created)}, confirm: 'not the name' }, { caller: 'verify-probe' });`);
+        assertThat('deleting a card requires the avatar echo',
+            guarded.success === false && guarded.error.code === 'CONFIRMATION_REQUIRED',
+            JSON.stringify(guarded.error));
+
+        const removed = await cdp.evaluate(`return await window.Loom.executeCapability('loom-host', 'characters.remove',
+            { avatar: ${JSON.stringify(created)}, confirm: ${JSON.stringify(created)} }, { caller: 'verify-probe' });`);
+        assertThat('characters.remove deletes the card',
+            removed.success === true && removed.data.removed === true, JSON.stringify(removed));
+        assertThat('the card file is gone', existsSync(filePath) === false, filePath);
+        created = null;
+    } finally {
+        if (created) {
+            await cdp.evaluate(`const context = window.SillyTavern.getContext();
+                await fetch('/api/characters/delete', {
+                    method: 'POST',
+                    headers: context.getRequestHeaders(),
+                    body: JSON.stringify({ avatar_url: ${JSON.stringify(created)}, delete_chats: false }),
+                });
+                return true;`);
+            await rm(path.join('D:\\1\\APP\\SillyTavern', 'data', 'default-user', 'chats', CARD_SCRATCH),
+                { recursive: true, force: true });
+        }
+    }
+}
+
 async function probeChatMutation(cdp) {
     // Edits and deletes are destructive, so they run on a scratch character's own
     // chat: create the card, select it, edit its greeting, check the chat file on
@@ -1647,6 +1711,7 @@ async function main() {
         await runProbe('extension install', probeExtensionInstall, cdp);
         await runProbe('world-book manager', probeWorldBookManager, cdp);
         await runProbe('character write', probeCharacterWrite, cdp);
+        await runProbe('card lifecycle', probeCardLifecycle, cdp);
         await runProbe('chat mutation', probeChatMutation, cdp);
         await runProbe('reload restore', probeReloadRestore, cdp);
 

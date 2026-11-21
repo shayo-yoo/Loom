@@ -107,8 +107,10 @@ test('registers the host adapter and its capabilities', () => {
     assert.deepEqual(
         listCapabilities(EXTENSION_ID).map(capability => capability.id).sort(),
         [
+            'characters.create',
             'characters.get',
             'characters.list',
+            'characters.remove',
             'characters.update',
             'chat.append',
             'chat.delete',
@@ -158,6 +160,8 @@ test('declares the write permission only on the mutating settings capabilities',
     assert.deepEqual(declared['worlds.import'], ['host.worldinfo.manage']);
     assert.deepEqual(declared['worlds.rename'], ['host.worldinfo.manage']);
     assert.deepEqual(declared['characters.update'], ['host.characters.write']);
+    assert.deepEqual(declared['characters.create'], ['host.characters.manage']);
+    assert.deepEqual(declared['characters.remove'], ['host.characters.manage']);
     assert.deepEqual(declared['characters.get'], [], 'reading a card stays ungated');
     assert.deepEqual(declared['worlds.export'], [], 'export is a read');
     assert.deepEqual(declared['characters.get'], []);
@@ -728,6 +732,179 @@ test('characters.update reports a stale memory copy when refresh fails', async (
         assert.equal(result.success, true, 'the file was written even if the memory refresh failed');
         assert.equal(result.data.refreshed, false, 'the caller is told the in-memory copy is stale');
         assert.equal(host.requests.length, 1);
+    } finally {
+        host.restore();
+    }
+});
+
+function stubCharacterLifecycleHost(options = {}) {
+    const requests = [];
+    const characters = options.characters ?? [{ name: 'Alice', avatar: 'alice.png' }];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (path, init) => {
+        requests.push({ path, body: JSON.parse(init.body) });
+        if (options.fail) return { ok: false, status: 400 };
+        if (path === '/api/characters/create') {
+            const avatar = options.avatar ?? 'new-card.png';
+            if (!options.skipRegister) characters.push({ name: options.createdName ?? 'New Card', avatar });
+            return { ok: true, status: 200, text: async () => options.emptyAvatar ? '' : avatar };
+        }
+        if (path === '/api/characters/delete' && !options.skipUnregister) {
+            const target = options.deleteAvatar ?? 'alice.png';
+            const index = characters.findIndex(character => character.avatar === target);
+            if (index >= 0) characters.splice(index, 1);
+        }
+        return { ok: true, status: 200 };
+    };
+    const context = {
+        chat: [],
+        characters,
+        characterId: options.characterId ?? 0,
+        getRequestHeaders: () => ({}),
+        getCharacters: async () => characters,
+    };
+    stubHost(context);
+    return { requests, characters, restore: () => { globalThis.fetch = originalFetch; } };
+}
+
+test('characters.create writes a card and reports the new avatar', async () => {
+    const host = stubCharacterLifecycleHost({ createdName: 'New Card' });
+    registerConsumer();
+    grantPermission(consumerId, 'host.characters.manage');
+    try {
+        const result = await executeCapability(EXTENSION_ID, 'characters.create', {
+            name: 'New Card',
+            fields: { description: 'from a test', firstMessage: 'hello', tags: ['a'] },
+        }, { caller: consumerId });
+
+        assert.deepEqual(result.data, { avatar: 'new-card.png', name: 'New Card', created: true });
+        assert.deepEqual(host.requests, [{
+            path: '/api/characters/create',
+            body: { ch_name: 'New Card', description: 'from a test', first_mes: 'hello', tags: ['a'] },
+        }]);
+        assert.ok(host.characters.some(character => character.avatar === 'new-card.png'));
+    } finally {
+        host.restore();
+    }
+});
+
+test('characters.create refuses an existing name and invalid names before writing', async () => {
+    const host = stubCharacterLifecycleHost();
+    registerConsumer();
+    grantPermission(consumerId, 'host.characters.manage');
+    try {
+        const duplicate = await executeCapability(EXTENSION_ID, 'characters.create',
+            { name: 'alice' }, { caller: consumerId });
+        assert.equal(duplicate.error.code, 'CHARACTER_EXISTS');
+        assert.deepEqual(duplicate.error.details, { avatar: 'alice.png' });
+
+        for (const name of ['', '   ', 'bad/name', 'bad\\name', 'bad:name', 'a'.repeat(81)]) {
+            const result = await executeCapability(EXTENSION_ID, 'characters.create',
+                { name }, { caller: consumerId });
+            assert.equal(result.error?.code ?? 'OK', result.error ? 'INVALID_INPUT' : 'OK', `name ${JSON.stringify(name)}`);
+            assert.equal(result.success, false, `${JSON.stringify(name)} must be refused`);
+        }
+        assert.deepEqual(host.requests, [], 'nothing reached the host');
+    } finally {
+        host.restore();
+    }
+});
+
+test('characters.create reports a host rejection, an empty avatar and an unregistered card', async () => {
+    const rejected = stubCharacterLifecycleHost({ fail: true });
+    registerConsumer();
+    grantPermission(consumerId, 'host.characters.manage');
+    try {
+        const result = await executeCapability(EXTENSION_ID, 'characters.create', { name: 'New Card' }, { caller: consumerId });
+        assert.equal(result.error.code, 'CHARACTER_CREATE_FAILED');
+    } finally {
+        rejected.restore();
+    }
+
+    const empty = stubCharacterLifecycleHost({ emptyAvatar: true });
+    try {
+        const result = await executeCapability(EXTENSION_ID, 'characters.create', { name: 'New Card' }, { caller: consumerId });
+        assert.equal(result.error.code, 'CHARACTER_CREATE_FAILED');
+    } finally {
+        empty.restore();
+    }
+
+    const unregistered = stubCharacterLifecycleHost({ skipRegister: true, avatar: 'ghost.png' });
+    try {
+        const result = await executeCapability(EXTENSION_ID, 'characters.create', { name: 'New Card' }, { caller: consumerId });
+        assert.equal(result.error.code, 'CHARACTER_CREATE_FAILED');
+        assert.deepEqual(result.error.details, { avatar: 'ghost.png' });
+    } finally {
+        unregistered.restore();
+    }
+});
+
+test('characters.remove requires the avatar echo and keeps the chat directory', async () => {
+    // characterId 99 = nothing is open, so the card is deletable.
+    const host = stubCharacterLifecycleHost({ characters: [{ name: 'Alice', avatar: 'alice.png' }], characterId: 99 });
+    registerConsumer();
+    grantPermission(consumerId, 'host.characters.manage');
+    try {
+        const guarded = await executeCapability(EXTENSION_ID, 'characters.remove',
+            { avatar: 'alice.png', confirm: 'Bob' }, { caller: consumerId });
+        assert.equal(guarded.error.code, 'CONFIRMATION_REQUIRED');
+        assert.deepEqual(guarded.error.details, { avatar: 'alice.png', name: 'Alice' });
+        assert.deepEqual(host.requests, []);
+
+        const removed = await executeCapability(EXTENSION_ID, 'characters.remove',
+            { avatar: 'alice.png', confirm: 'alice.png' }, { caller: consumerId });
+        assert.equal(removed.success, true, JSON.stringify(removed.error));
+        assert.deepEqual(removed.data, { avatar: 'alice.png', removed: true });
+        assert.deepEqual(host.requests, [{
+            path: '/api/characters/delete',
+            body: { avatar_url: 'alice.png', delete_chats: false },
+        }], 'deleting a card must not delete its chats');
+    } finally {
+        host.restore();
+    }
+});
+
+test('characters.remove refuses the open character and reports an unsupported host', async () => {
+    const active = stubCharacterLifecycleHost({
+        characters: [{ name: 'Alice', avatar: 'alice.png' }, { name: 'Bob', avatar: 'bob.png' }],
+        characterId: 0,
+    });
+    registerConsumer();
+    grantPermission(consumerId, 'host.characters.manage');
+    try {
+        const result = await executeCapability(EXTENSION_ID, 'characters.remove',
+            { avatar: 'alice.png', confirm: 'Alice' }, { caller: consumerId });
+        assert.equal(result.error.code, 'CHARACTER_IN_USE');
+        assert.deepEqual(result.error.details, { avatar: 'alice.png' });
+        assert.deepEqual(active.requests, []);
+    } finally {
+        active.restore();
+    }
+
+    const unsupported = stubCharacterLifecycleHost();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = undefined;
+    try {
+        const result = await executeCapability(EXTENSION_ID, 'characters.remove',
+            { avatar: 'alice.png', confirm: 'Alice' }, { caller: consumerId });
+        assert.equal(result.error.code, 'HOST_UNSUPPORTED');
+    } finally {
+        globalThis.fetch = originalFetch;
+        unsupported.restore();
+    }
+});
+
+test('card lifecycle capabilities are gated by host.characters.manage', async () => {
+    const host = stubCharacterLifecycleHost();
+    registerConsumer();
+    try {
+        const created = await executeCapability(EXTENSION_ID, 'characters.create', { name: 'Other' }, { caller: consumerId });
+        assert.equal(created.error.code, 'PERMISSION_DENIED');
+        assert.deepEqual(created.error.details.missing, ['host.characters.manage']);
+        const removed = await executeCapability(EXTENSION_ID, 'characters.remove',
+            { avatar: 'alice.png', confirm: 'Alice' }, { caller: consumerId });
+        assert.equal(removed.error.code, 'PERMISSION_DENIED');
+        assert.deepEqual(host.requests, []);
     } finally {
         host.restore();
     }

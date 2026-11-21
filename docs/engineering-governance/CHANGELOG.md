@@ -1,5 +1,7 @@
 # Change Log
 
+- [CHG-20261122-031](history/recent/CHG-20261122-031.md): Character card lifecycle — `characters.create`/`characters.remove` behind `host.characters.manage`, name-echo deletion, open-character refusal (0.28.0).
+- [CHG-20261122-030](history/recent/CHG-20261122-030.md): Loom buttons collapsed to `min-content` by SillyTavern's global `.menu_button` rule — intrinsic width restored, layout pinned by the browser harness (0.28.0).
 - [CHG-20261121-029](history/recent/CHG-20261121-029.md): Developer guide, `textarea`/`select` improvements, and the user-visible `world-book-manager` extension (0.27.0).
 - [CHG-20261121-028](history/recent/CHG-20261121-028.md): Extension discovery and installation — package convention, generated index, persisted installs, panel install section, example `hello-loom` (0.26.0).
 - [CHG-20261121-027](history/recent/CHG-20261121-027.md): `chat.append` allowlist fix — default type had no host template; real append verified on a scratch chat (0.25.0).

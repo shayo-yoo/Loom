@@ -1,7 +1,7 @@
 import '../Loom%20Core/index.js';
 
 const EXTENSION_ID = 'loom-host';
-const HOST_VERSION = '0.27.0';
+const HOST_VERSION = '0.28.0';
 const runtime = globalThis.Loom;
 
 const nullInput = { type: 'null' };
@@ -1031,6 +1031,7 @@ const characterCardCapability = {
 };
 
 const CHARACTERS_WRITE_SCOPE = 'host.characters.write';
+const CHARACTERS_MANAGE_SCOPE = 'host.characters.manage';
 const CHARACTER_FIELD_LIMIT = 100_000;
 const CHARACTER_TAG_LIMIT = 50;
 
@@ -1174,6 +1175,194 @@ const charactersUpdateCapability = {
             }
         }
         return { avatar, name: String(character.name ?? ''), updated: updated.sort(), refreshed };
+    },
+};
+
+/**
+ * Card lifecycle.
+ *
+ * Creating and destroying a character card are the only operations that change the
+ * user's library itself, so they sit behind their own permission
+ * (`host.characters.manage`) and deletion requires the caller to echo the avatar
+ * filename, turning a stale variable into a typed error instead of a lost card.
+ *
+ * SillyTavern exposes no `getContext()` function for either operation, so the
+ * adapter uses its own `/api/characters/{create,delete}` endpoints — the same
+ * documented exception the world-book lifecycle uses.
+ */
+function assertCharacterName(name) {
+    if (typeof name !== 'string' || name.trim() === '') {
+        throw typedError('INVALID_INPUT', 'Character name must be a non-empty string.');
+    }
+    if (name.length > 80) {
+        throw typedError('INVALID_INPUT', 'Character name is longer than 80 characters.');
+    }
+    if (/[\\/:*?"<>|\u0000]/.test(name)) {
+        throw typedError('INVALID_INPUT', 'Character name must not contain path or filename characters.', {
+            characters: '\\ / : * ? " < > |',
+        });
+    }
+}
+
+function findCharacterIndex(context, identity) {
+    const characters = context.characters;
+    if (!Array.isArray(characters)) return -1;
+    const wanted = String(identity).trim().toLowerCase();
+    return characters.findIndex(item => (
+        String(item?.name ?? '').toLowerCase() === wanted
+        || String(item?.avatar ?? '').toLowerCase() === wanted
+    ));
+}
+
+const charactersCreateCapability = {
+    id: 'characters.create',
+    name: '创建角色卡',
+    description: '新建一张角色卡（可选初始字段）；需要 host.characters.manage 授权。同名角色已存在时拒绝。',
+    permissions: [CHARACTERS_MANAGE_SCOPE],
+    input: {
+        type: 'object',
+        required: ['name'],
+        properties: {
+            name: { type: 'string', minLength: 1, maxLength: 80 },
+            fields: {
+                type: 'object',
+                required: [],
+                properties: characterPatchProperties,
+                additionalProperties: false,
+            },
+        },
+        additionalProperties: false,
+    },
+    output: {
+        type: 'object',
+        required: ['avatar', 'name', 'created'],
+        properties: {
+            avatar: { type: 'string' },
+            name: { type: 'string' },
+            created: { type: 'boolean' },
+        },
+        additionalProperties: false,
+    },
+    execute: async (input) => {
+        const context = getHostContext();
+        if (typeof globalThis.fetch !== 'function') {
+            throw typedError('HOST_UNSUPPORTED', 'This environment has no fetch() for character creation.');
+        }
+        assertCharacterName(input.name);
+        const existing = findCharacter(context, input.name);
+        if (existing) {
+            throw typedError('CHARACTER_EXISTS', `A character with that name already exists: ${input.name}`, {
+                avatar: String(existing.avatar ?? ''),
+            });
+        }
+
+        const body = { ch_name: input.name };
+        for (const [field, value] of Object.entries(input.fields ?? {})) {
+            // `tags` is the one field that is not a plain text→host-key mapping.
+            if (field === 'tags') body.tags = [...value];
+            else body[CHARACTER_PATCH_FIELDS[field]] = value;
+        }
+
+        const headers = { 'Content-Type': 'application/json', ...(context.getRequestHeaders?.() ?? {}) };
+        let response;
+        try {
+            response = await globalThis.fetch('/api/characters/create', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(body),
+            });
+        } catch (error) {
+            throw typedError('CHARACTER_CREATE_FAILED', `Character creation failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (!response || response.ok === false) {
+            throw typedError('CHARACTER_CREATE_FAILED', `SillyTavern rejected the character (status ${response?.status ?? 'unknown'}).`);
+        }
+        const avatar = String(await response.text()).trim();
+        if (!avatar) {
+            throw typedError('CHARACTER_CREATE_FAILED', 'SillyTavern did not return an avatar filename.');
+        }
+
+        await context.getCharacters?.();
+        const registered = Array.isArray(context.characters)
+            && context.characters.some(item => String(item?.avatar ?? '') === avatar);
+        if (!registered) {
+            throw typedError('CHARACTER_CREATE_FAILED', `The host did not register the new character: ${avatar}`, { avatar });
+        }
+        return { avatar, name: input.name, created: true };
+    },
+};
+
+const charactersRemoveCapability = {
+    id: 'characters.remove',
+    name: '删除角色卡',
+    description: '按头像文件名删除角色卡（破坏性）；必须在 confirm 中回写头像文件名或角色名；需要 host.characters.manage 授权。',
+    permissions: [CHARACTERS_MANAGE_SCOPE],
+    input: {
+        type: 'object',
+        required: ['avatar', 'confirm'],
+        properties: {
+            avatar: { type: 'string', minLength: 1, maxLength: 200 },
+            confirm: { type: 'string', minLength: 1, maxLength: 200 },
+        },
+        additionalProperties: false,
+    },
+    output: {
+        type: 'object',
+        required: ['avatar', 'removed'],
+        properties: {
+            avatar: { type: 'string' },
+            removed: { type: 'boolean' },
+        },
+        additionalProperties: false,
+    },
+    execute: async (input) => {
+        const context = getHostContext();
+        if (typeof globalThis.fetch !== 'function') {
+            throw typedError('HOST_UNSUPPORTED', 'This environment has no fetch() for character deletion.');
+        }
+        const character = findCharacter(context, input.avatar);
+        if (!character) {
+            throw typedError('CHARACTER_NOT_FOUND', `Character not found: ${input.avatar}`);
+        }
+        const avatar = String(character.avatar ?? '');
+        const name = String(character.name ?? '');
+        if (input.confirm !== avatar && input.confirm !== name) {
+            throw typedError('CONFIRMATION_REQUIRED', 'Deleting a character requires confirm to repeat its avatar filename or name exactly.', {
+                avatar,
+                name,
+            });
+        }
+
+        // Deleting the open character makes SillyTavern reload the chat area
+        // mid-call; the user can switch away first and retry.
+        const index = findCharacterIndex(context, avatar);
+        if (index >= 0 && String(context.characterId) === String(index)) {
+            throw typedError('CHARACTER_IN_USE', 'The character is currently open; switch to another character before deleting it.', {
+                avatar,
+            });
+        }
+
+        let response;
+        try {
+            response = await globalThis.fetch('/api/characters/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...(context.getRequestHeaders?.() ?? {}) },
+                // The chat directory is user data; deletion of the card must not
+                // silently take the conversations with it.
+                body: JSON.stringify({ avatar_url: avatar, delete_chats: false }),
+            });
+        } catch (error) {
+            throw typedError('CHARACTER_REMOVE_FAILED', `Character deletion failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (!response || response.ok === false) {
+            throw typedError('CHARACTER_REMOVE_FAILED', `SillyTavern rejected the deletion (status ${response?.status ?? 'unknown'}).`, { avatar });
+        }
+
+        await context.getCharacters?.();
+        if (Array.isArray(context.characters) && context.characters.some(item => String(item?.avatar ?? '') === avatar)) {
+            throw typedError('CHARACTER_REMOVE_FAILED', `The host still lists the character after deletion: ${avatar}`, { avatar });
+        }
+        return { avatar, removed: true };
     },
 };
 
@@ -1695,6 +1884,8 @@ const CAPABILITIES = Object.freeze([
     charactersCapability,
     characterCardCapability,
     charactersUpdateCapability,
+    charactersCreateCapability,
+    charactersRemoveCapability,
     worldsCapability,
     worldsCreateCapability,
     worldsRemoveCapability,

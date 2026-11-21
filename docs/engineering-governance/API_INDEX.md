@@ -104,6 +104,8 @@ Write capabilities (the read/write split required by Core requirements §5):
 | `worlds.export` | `{ name }` | `{ name, entries, data }` | — |
 | `worlds.import` | `{ name, data }` | `{ name, entries, created }` | `host.worldinfo.manage` |
 | `worlds.rename` | `{ name, to, confirm }` | `{ from, to, migrated }` | `host.worldinfo.manage` |
+| `characters.create` | `{ name, fields? }` | `{ avatar, name, created }` | `host.characters.manage` |
+| `characters.remove` | `{ avatar, confirm }` | `{ avatar, removed }` | `host.characters.manage` |
 
 Data movement and renaming:
 
@@ -149,6 +151,12 @@ Whole-book lifecycle (destructive, hence a separate permission):
 - The write goes through SillyTavern's own `/api/characters/merge-attributes` (the endpoint its editor uses) rather than a hand-rolled PNG rewrite: the endpoint deep-merges into the V2 `data` block, which the host normalises over the legacy top-level copy when reading. Writing the legacy copy too would create a second source of truth the host does not maintain — third-party tools that read V1 fields without `data` therefore see stale text (documented limitation, not a workaround).
 - The in-memory `context.characters` copy is refreshed through the host's `getCharacters()`; a card that still shows the old text after the write fails with `CHARACTER_UPDATE_FAILED` instead of reporting a silent success.
 - The browser harness writes a scratch card, parses the PNG's `chara` tEXt chunk to assert the V2 `data` block carries the edit, and deletes the scratch card afterwards.
+
+`characters.create` / `characters.remove` are the card lifecycle:
+
+- Both require `host.characters.manage` — separate from `host.characters.write`, so editing fields never implies creating or deleting a card. SillyTavern exposes no `getContext()` function for either, so the adapter calls `/api/characters/create` and `/api/characters/delete` (the same documented exception as the world-book lifecycle).
+- `create` validates the name before any request (≤ 80 chars, no path/filename characters, since the name becomes a filename), refuses a case-insensitive existing name (`CHARACTER_EXISTS`, `details.avatar`), accepts the same initial-field whitelist as `characters.update`, refreshes `getCharacters()` and requires the new card to be listed (`CHARACTER_CREATE_FAILED`).
+- `remove` requires `confirm` to echo the avatar filename **or** the character name (`CONFIRMATION_REQUIRED`, `details.avatar`/`details.name`), refuses the currently open character (`CHARACTER_IN_USE`, because the host reloads the chat area mid-call), and deletes with `delete_chats: false` — the card goes, the conversations stay. A card still listed after deletion is `CHARACTER_REMOVE_FAILED`.
 
 `worlds.entry.update` is the world-book write contract:
 
