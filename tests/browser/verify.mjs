@@ -1362,6 +1362,55 @@ async function probeWorldBookManager(cdp) {
     assertThat('the manager panel closes from its launcher', closed === true);
 }
 
+async function probeButtonLayout(cdp) {
+    // SillyTavern's global `.menu_button { width: min-content }` used to collapse
+    // Loom's labels to one word and wrap the rest vertically. These checks pin
+    // the layout: a button must be wider than its font size and shorter than a
+    // wrapped column.
+    const layout = await cdp.evaluate(`const reveal = element => {
+        const saved = [];
+        for (let node = element; node; node = node.parentElement) {
+            if (getComputedStyle(node).display === 'none') {
+                saved.push([node, node.style.display]);
+                node.style.display = 'block';
+            }
+        }
+        return () => { for (const [node, value] of saved) node.style.display = value; };
+    };
+    const box = element => {
+        if (!element) return null;
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return { w: Math.round(rect.width), h: Math.round(rect.height), ws: style.whiteSpace };
+    };
+
+    document.getElementById('loom_settings_entry')?.classList?.add('open');
+    document.querySelector('#loom_settings_entry .inline-drawer-toggle')?.click();
+    const settingsButton = document.getElementById('loom_settings_open');
+    const restoreSettings = settingsButton ? reveal(settingsButton) : () => {};
+    const settings = box(settingsButton);
+    restoreSettings();
+
+    document.getElementById('loom_settings_open')?.click();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const panel = document.getElementById('loom_panel');
+    const result = {
+        settings,
+        permission: box(document.querySelector('#loom_permissions button')),
+        install: box(document.getElementById('loom_installer_button')),
+        header: box(document.querySelector('#loom_panel_actions, .loom_panel_actions button')),
+    };
+    document.getElementById('loom_close')?.click();
+    return result;`);
+    const ok = entry => Boolean(entry) && entry.w >= 36 && entry.h <= 60;
+    assertThat('the settings entry button keeps an intrinsic width',
+        ok(layout.settings) && layout.settings.ws === 'nowrap',
+        JSON.stringify(layout.settings));
+    assertThat('panel action buttons do not collapse vertically',
+        ok(layout.permission) && ok(layout.install),
+        JSON.stringify({ permission: layout.permission, install: layout.install }));
+}
+
 async function probeWorldRename(cdp) {
     await cdp.evaluate(`const Loom = window.Loom;
         if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) Loom.loadExtension({ id: 'verify-probe', name: 'Verify Probe' });
@@ -1581,6 +1630,7 @@ async function main() {
         await probeRuntime(cdp);
         await runProbe('entries', probeEntries, cdp);
         await runProbe('panel', probePanel, cdp);
+        await runProbe('button layout', probeButtonLayout, cdp);
         await runProbe('live reads', probeLiveReads, cdp);
         await runProbe('permission flow', probePermissionFlow, cdp);
         await runProbe('consent prompt', probeConsent, cdp);

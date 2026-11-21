@@ -2,6 +2,28 @@
     cursor: pointer;
 }
 
+/*
+ * SillyTavern's global `.menu_button` sets `width: min-content`, which collapses a
+ * label like "Hello Loom · 未授权" to the width of one word and wraps the rest
+ * vertically — every Loom button looked like a thin column. Restore intrinsic
+ * width and keep labels on one line; the panel's own rows provide the height.
+ */
+.loom_panel .menu_button,
+.loom_settings_open,
+#loom_installer .menu_button {
+    width: auto;
+    max-width: 100%;
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+/* Icon-only header buttons still need a comfortable tap target. */
+.loom_panel_actions .menu_button {
+    min-width: 44px;
+    min-height: 44px;
+    justify-content: center;
+}
+
 .loom_panel {
     position: fixed;
     z-index: 10000;
