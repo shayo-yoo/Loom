@@ -77,7 +77,8 @@ function renderPanel() {
     const container = document.createElement('div');
     container.id = PANEL_ID;
     container.style.cssText = [
-        'position:fixed', 'right:16px', 'bottom:72px', 'width:400px', 'max-height:70vh',
+        // Fits a phone: the panel never exceeds the viewport minus its own margins.
+        'position:fixed', 'right:16px', 'bottom:72px', 'width:min(400px, calc(100vw - 32px))', 'max-height:70vh',
         'overflow:auto', 'z-index:30000', 'padding:12px', 'border-radius:8px',
         'border:1px solid var(--SmartThemeBorderColor, #777)',
         'background:var(--SmartThemeBlurTintColor, #1e1e1e)',

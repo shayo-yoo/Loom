@@ -40,6 +40,8 @@ import {
     normalizeIndex,
     normalizeUserSource,
     rememberInstalled,
+    scriptIdFor,
+    scriptSlug,
 } from './installer.js';
 
 const PANEL_ID = 'loom_panel';
@@ -68,11 +70,16 @@ let consentView = null;
  * identity, dependency and failure handling in one place.
  */
 const INSTALLER_SECTION_ID = 'loom_installer';
+const SCRIPT_SECTION_ID = 'loom_scripts';
 const INSTALL_STATE_KEY = 'installedExtensions';
+const DISABLED_STATE_KEY = 'disabledExtensions';
+const SCRIPTS_STATE_KEY = 'scripts';
 const LOOM_ROOT = new URL('../', import.meta.url);
 const bundledSources = [];
 const installProblems = [];
 let installedEntries = [];
+let disabledIds = [];
+let scripts = [];
 
 function ensureExtension() {
     if (!runtime?.registerExtension || runtime.listExtensions().some(extension => extension.id === EXTENSION_ID)) {
@@ -97,6 +104,7 @@ function installBuiltinComponents() {
 }
 
 let installerBooted = false;
+let installerReady = false;
 
 function readInstalledEntries() {
     const stored = runtime?.getState?.(EXTENSION_ID, INSTALL_STATE_KEY);
@@ -106,6 +114,48 @@ function readInstalledEntries() {
 function persistInstalledEntries(list) {
     installedEntries = list;
     runtime?.setState?.(EXTENSION_ID, INSTALL_STATE_KEY, list);
+}
+
+function readDisabledIds() {
+    const stored = runtime?.getState?.(EXTENSION_ID, DISABLED_STATE_KEY);
+    return Array.isArray(stored) ? stored.filter(id => typeof id === 'string') : [];
+}
+
+function persistDisabledIds(list) {
+    disabledIds = [...new Set(list)];
+    runtime?.setState?.(EXTENSION_ID, DISABLED_STATE_KEY, disabledIds);
+}
+
+function readScripts() {
+    const stored = runtime?.getState?.(EXTENSION_ID, SCRIPTS_STATE_KEY);
+    return Array.isArray(stored)
+        ? stored.filter(script => script && typeof script.id === 'string' && typeof script.source === 'string')
+        : [];
+}
+
+function persistScripts(list) {
+    scripts = list;
+    runtime?.setState?.(EXTENSION_ID, SCRIPTS_STATE_KEY, list);
+}
+
+/** Merged, de-duplicated view of bundled and manually installed packages. */
+function allSources() {
+    const sources = [];
+    const seen = new Set();
+    for (const source of [...bundledSources, ...installedEntries]) {
+        if (!source?.entry || seen.has(source.entry)) continue;
+        seen.add(source.entry);
+        sources.push(source);
+    }
+    return sources;
+}
+
+function findSource(identity) {
+    return allSources().find(source => source.id === identity || source.entry === identity) ?? null;
+}
+
+function isDisabled(identity) {
+    return disabledIds.includes(identity);
 }
 
 async function loadBundledIndex() {
@@ -155,21 +205,64 @@ async function bootExtensions() {
 
     installProblems.length = 0;
     installedEntries = readInstalledEntries();
+    disabledIds = readDisabledIds();
+    scripts = readScripts();
 
     const index = await loadBundledIndex();
     bundledSources.push(...index.sources);
     installProblems.push(...index.problems);
 
-    for (const source of bundledSources) {
+    for (const source of allSources()) {
+        if (source.id && isDisabled(source.id)) continue;
         await importSource(source);
     }
-    for (const entry of installedEntries) {
-        if (bundledSources.some(source => source.entry === entry.entry)) continue;
-        await importSource({ ...entry, manifest: entry.manifest ?? '', bundled: false });
+    for (const script of scripts) {
+        await runScript(script);
     }
 
+    installerReady = true;
+    renderInstaller();
+    renderScripts();
+    renderExtensionStates();
+}
+
+/** Enable or disable an installed package without touching its files. */
+async function setExtensionEnabled(identity, enabled) {
+    const source = findSource(identity);
+    if (!source) throw new Error(`未找到扩展：${identity}`);
+
+    if (!enabled) {
+        if (source.id) runtime?.unloadExtension?.(source.id);
+        persistDisabledIds([...disabledIds, source.id ?? identity]);
+    } else {
+        persistDisabledIds(disabledIds.filter(id => id !== (source.id ?? identity)));
+        await importSource(source);
+    }
     renderInstaller();
     renderExtensionStates();
+    return Boolean(enabled);
+}
+
+/**
+ * Reload a package from its source.
+ *
+ * Browser modules cannot be unloaded, so the dynamic import is cache-busted for
+ * manual installs: editing a module file and reloading actually picks up the new
+ * code instead of the module the page already holds.
+ */
+async function reloadExtension(identity) {
+    const source = findSource(identity);
+    if (!source) throw new Error(`未找到扩展：${identity}`);
+    if (source.id) runtime?.unloadExtension?.(source.id);
+    persistDisabledIds(disabledIds.filter(id => id !== (source.id ?? identity)));
+
+    const entry = source.bundled
+        ? source.entry
+        : `${source.entry}${source.entry.includes('?') ? '&' : '?'}loomReload=${Date.now()}`;
+    await importSource({ ...source, entry });
+    renderInstaller();
+    renderExtensionStates();
+    return entry;
 }
 
 async function installExtension(url) {
@@ -200,9 +293,121 @@ async function uninstallExtension(target) {
     if (!entry) throw new Error(`未找到已安装扩展：${target}`);
     if (entry.id) runtime?.unloadExtension?.(entry.id);
     persistInstalledEntries(forgetInstalled(installedEntries, target));
+    persistDisabledIds(disabledIds.filter(id => id !== target));
     renderInstaller();
     renderExtensionStates();
     return entry.entry;
+}
+
+/**
+ * Scripts — the lightweight form of an extension.
+ *
+ * A script is a module source kept in Loom's own state and imported through a
+ * Blob URL: no package directory, no manifest file. It still gets a real
+ * extension id (so permissions, state, errors and unload behave like any other
+ * extension), but the author only writes hooks. No sandbox is implied: this is a
+ * local loader, not a hostile-code boundary.
+ */
+function slugFor(name) {
+    return scriptSlug(name);
+}
+
+function nextScriptId(name) {
+    return scriptIdFor(name, scripts.map(script => script.id));
+}
+
+async function runScript(record) {
+    if (typeof Blob !== 'function' || typeof URL?.createObjectURL !== 'function') {
+        installProblems.push(`${record.name ?? record.id}: 当前环境不支持 Blob 模块`);
+        return null;
+    }
+    const url = URL.createObjectURL(new Blob([record.source], { type: 'text/javascript' }));
+    try {
+        const result = await runtime.importExtension(url, {
+            // Identity comes from the script record, so the source only needs hooks.
+            manifest: {
+                id: record.id,
+                name: record.name || record.id,
+                version: '0.0.0',
+                dependencies: [],
+                permissions: [],
+            },
+        });
+        if (result?.state === 'failed' || result?.error) {
+            installProblems.push(`${record.name ?? record.id}: ${result?.error?.message ?? '脚本运行失败'}`);
+        }
+        return result;
+    } catch (error) {
+        installProblems.push(`${record.name ?? record.id}: ${error instanceof Error ? error.message : String(error)}`);
+        return { state: 'failed', error: { message: error instanceof Error ? error.message : String(error) } };
+    } finally {
+        URL.revokeObjectURL(url);
+    }
+}
+
+async function saveScript(name, source) {
+    const trimmed = String(source ?? '').trim();
+    if (!trimmed) throw new Error('脚本内容为空。');
+    const record = { id: nextScriptId(name), name: String(name ?? '').trim() || '未命名脚本', source: trimmed };
+    const result = await runScript(record);
+    if (result?.state === 'failed' || result?.error) {
+        throw new Error(`脚本运行失败：${result?.error?.message ?? '未知错误'}`);
+    }
+    persistScripts([...scripts, record]);
+    renderScripts();
+    renderInstaller();
+    return record.id;
+}
+
+async function updateScript(id, source) {
+    const index = scripts.findIndex(script => script.id === id);
+    if (index < 0) throw new Error(`未找到脚本：${id}`);
+    const previous = scripts[index];
+    const next = { ...previous, source: String(source ?? '').trim() };
+    if (!next.source) throw new Error('脚本内容为空。');
+    runtime?.unloadExtension?.(id);
+    const result = await runScript(next);
+    if (result?.state === 'failed' || result?.error) {
+        // Keep the known-good source running and report the failure.
+        await runScript(previous);
+        throw new Error(`脚本运行失败：${result?.error?.message ?? '未知错误'}`);
+    }
+    const list = [...scripts];
+    list[index] = next;
+    persistScripts(list);
+    renderScripts();
+    return id;
+}
+
+async function deleteScript(id) {
+    if (!scripts.some(script => script.id === id)) throw new Error(`未找到脚本：${id}`);
+    runtime?.unloadExtension?.(id);
+    persistScripts(scripts.filter(script => script.id !== id));
+    renderScripts();
+    renderInstaller();
+    return id;
+}
+
+function renderScripts() {
+    const list = document.getElementById(`${SCRIPT_SECTION_ID}_list`);
+    if (!list) return;
+    list.innerHTML = scripts.length === 0
+        ? '<p class="loom_hint">还没有脚本。写一个小模块即可，不必建扩展目录。</p>'
+        : scripts.map(script => {
+            const state = runtime?.getExtensionState?.(script.id);
+            const status = state?.state ?? '未运行';
+            const error = state?.error?.message ?? '';
+            return `
+                <div class="loom_install_row">
+                    <div class="loom_install_main">
+                        <strong>${escapeHtml(script.name)}</strong>
+                        <span class="loom_hint">${escapeHtml(script.id)} · ${escapeHtml(status)}</span>
+                        ${error ? `<span class="loom_install_error">${escapeHtml(error)}</span>` : ''}
+                    </div>
+                    <button type="button" class="menu_button" data-script-run="${escapeHtml(script.id)}">重新运行</button>
+                    <button type="button" class="menu_button" data-script-delete="${escapeHtml(script.id)}">删除</button>
+                </div>`;
+        }).join('');
 }
 
 function renderInstaller() {
@@ -210,20 +415,27 @@ function renderInstaller() {
     const problems = document.getElementById(`${INSTALLER_SECTION_ID}_problems`);
     if (!list) return;
 
-    const sources = [];
-    const seen = new Set();
-    for (const source of [...bundledSources, ...installedEntries]) {
-        if (!source?.entry || seen.has(source.entry)) continue;
-        seen.add(source.entry);
-        sources.push(source);
-    }
+    const sources = allSources();
     const states = sources.map(source => (source.id ? runtime?.getExtensionState?.(source.id) : null)).filter(Boolean);
     const rows = describeInstalled(sources, states);
 
     list.innerHTML = rows.length === 0
         ? '<p class="loom_hint">还没有扩展。把扩展目录放进 extensions/ 并运行 npm run extensions:index，或粘贴模块地址手动安装。</p>'
         : rows.map(row => {
-            const meta = [row.bundled ? '内置' : '手动安装', row.state].filter(Boolean).join(' · ');
+            const disabled = isDisabled(row.id);
+            const detail = [
+                row.version ? `v${row.version}` : '',
+                row.bundled ? '内置' : '手动安装',
+                disabled ? '已停用' : row.state,
+                row.permissions.length ? `权限：${row.permissions.join('、')}` : '',
+                row.dependencies.length ? `依赖：${row.dependencies.join('、')}` : '',
+            ].filter(Boolean).join(' · ');
+            const toggle = row.id
+                ? `<button type="button" class="menu_button" data-loom-toggle="${escapeHtml(row.id)}" data-enabled="${disabled}">${disabled ? '启用' : '停用'}</button>`
+                : '';
+            const reload = row.id
+                ? `<button type="button" class="menu_button" data-loom-reload="${escapeHtml(row.id)}">重新加载</button>`
+                : '';
             const remove = row.bundled
                 ? ''
                 : `<button type="button" class="menu_button" data-loom-uninstall="${escapeHtml(row.id || row.entry)}">移除</button>`;
@@ -231,10 +443,10 @@ function renderInstaller() {
                 <div class="loom_install_row">
                     <div class="loom_install_main">
                         <strong>${escapeHtml(row.name || row.id || row.entry)}</strong>
-                        <span class="loom_hint">${escapeHtml(meta)}</span>
+                        <span class="loom_hint">${escapeHtml(detail)}</span>
                         ${row.error ? `<span class="loom_install_error">${escapeHtml(row.error)}</span>` : ''}
                     </div>
-                    ${remove}
+                    ${toggle}${reload}${remove}
                 </div>`;
         }).join('');
 
@@ -281,14 +493,89 @@ function mountInstallerSection() {
         }
     });
     section.addEventListener('click', async event => {
-        const button = event.target.closest('[data-loom-uninstall]');
-        if (!button) return;
-        button.disabled = true;
+        const uninstall = event.target.closest('[data-loom-uninstall]');
+        const toggle = event.target.closest('[data-loom-toggle]');
+        const reload = event.target.closest('[data-loom-reload]');
         try {
-            await uninstallExtension(button.dataset.loomUninstall);
+            if (uninstall) {
+                uninstall.disabled = true;
+                await uninstallExtension(uninstall.dataset.loomUninstall);
+            } else if (toggle) {
+                toggle.disabled = true;
+                await setExtensionEnabled(toggle.dataset.loomToggle, toggle.dataset.enabled !== 'true');
+            } else if (reload) {
+                reload.disabled = true;
+                await reloadExtension(reload.dataset.loomReload);
+            }
         } catch (error) {
             installProblems.push(error instanceof Error ? error.message : String(error));
             renderInstaller();
+        }
+    });
+}
+
+function mountScriptSection() {
+    if (document.getElementById(SCRIPT_SECTION_ID)) return;
+    const content = document.querySelector(`#${PANEL_ID} .loom_panel_content`);
+    if (!content) return;
+
+    const section = document.createElement('section');
+    section.id = SCRIPT_SECTION_ID;
+    section.innerHTML = `
+        <h3>脚本</h3>
+        <p class="loom_hint">一个文件就是一个功能：module 默认导出 activate/deactivate 即可，无需扩展目录与清单。运行后拥有自己的扩展身份。</p>
+        <div class="loom_installer_controls">
+            <input type="text" id="${SCRIPT_SECTION_ID}_name" placeholder="脚本名称" />
+        </div>
+        <textarea id="${SCRIPT_SECTION_ID}_source" class="loom-textarea" rows="6" placeholder="export default { activate({ id }) { Loom.setState(id, 'ran', true); } };"></textarea>
+        <div class="loom_installer_controls">
+            <button type="button" class="menu_button" id="${SCRIPT_SECTION_ID}_save">保存并运行</button>
+            <span class="loom_hint" id="${SCRIPT_SECTION_ID}_status"></span>
+        </div>
+        <div id="${SCRIPT_SECTION_ID}_list"></div>
+    `;
+    content.append(section);
+
+    section.querySelector(`#${SCRIPT_SECTION_ID}_save`)?.addEventListener('click', async event => {
+        const button = event.currentTarget;
+        const name = section.querySelector(`#${SCRIPT_SECTION_ID}_name`)?.value ?? '';
+        const source = section.querySelector(`#${SCRIPT_SECTION_ID}_source`)?.value ?? '';
+        const status = section.querySelector(`#${SCRIPT_SECTION_ID}_status`);
+        button.disabled = true;
+        try {
+            await saveScript(name, source);
+            if (status) status.textContent = '已保存并运行。';
+            const sourceField = section.querySelector(`#${SCRIPT_SECTION_ID}_source`);
+            if (sourceField) sourceField.value = '';
+        } catch (error) {
+            if (status) status.textContent = error instanceof Error ? error.message : String(error);
+        } finally {
+            button.disabled = false;
+        }
+    });
+
+    section.addEventListener('click', async event => {
+        const run = event.target.closest('[data-script-run]');
+        const remove = event.target.closest('[data-script-delete]');
+        try {
+            if (run) {
+                run.disabled = true;
+                const record = scripts.find(script => script.id === run.dataset.scriptRun);
+                if (record) {
+                    runtime?.unloadExtension?.(record.id);
+                    const result = await runScript(record);
+                    if (result?.state === 'failed') throw new Error(result.error?.message ?? '运行失败');
+                }
+                renderScripts();
+                renderInstaller();
+            } else if (remove) {
+                remove.disabled = true;
+                await deleteScript(remove.dataset.scriptDelete);
+            }
+        } catch (error) {
+            const status = section.querySelector(`#${SCRIPT_SECTION_ID}_status`);
+            if (status) status.textContent = error instanceof Error ? error.message : String(error);
+            renderScripts();
         }
     });
 }
@@ -321,9 +608,17 @@ function installUiApi() {
         installExtension: (url) => installExtension(url),
         uninstallExtension: (target) => uninstallExtension(target),
         getInstalledExtensions: () => describeInstalled(
-            [...bundledSources, ...installedEntries],
-            bundledSources.map(source => runtime?.getExtensionState?.(source.id)).filter(Boolean),
+            allSources(),
+            allSources().map(source => runtime?.getExtensionState?.(source.id)).filter(Boolean),
         ),
+        setExtensionEnabled: (id, enabled) => setExtensionEnabled(id, enabled),
+        reloadExtension: (id) => reloadExtension(id),
+        saveScript: (name, source) => saveScript(name, source),
+        updateScript: (id, source) => updateScript(id, source),
+        deleteScript: (id) => deleteScript(id),
+        listScripts: () => scripts.map(script => ({ id: script.id, name: script.name, length: script.source.length })),
+        getInstallProblems: () => [...installProblems],
+        isReady: () => installerReady,
     });
     globalThis.LoomUI = ui;
     runtime.registerCapability(EXTENSION_ID, {
@@ -756,6 +1051,7 @@ function installPanel() {
     `;
     document.body.append(panel);
     mountInstallerSection();
+    mountScriptSection();
     document.getElementById('loom_close').addEventListener('click', closePanel);
     document.getElementById('loom_refresh').addEventListener('click', renderPanel);
     // Delegated: the permission list is re-rendered on every toggle, so bind to

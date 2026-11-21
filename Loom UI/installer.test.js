@@ -8,6 +8,8 @@ import {
     normalizeUserSource,
     rememberInstalled,
     resolveEntryUrl,
+    scriptIdFor,
+    scriptSlug,
 } from './installer.js';
 
 const BASE = 'http://127.0.0.1:8100/scripts/extensions/third-party/Loom/';
@@ -76,9 +78,32 @@ test('forgets an install by id or by entry URL', () => {
     assert.deepEqual(forgetInstalled(installed, 'missing'), installed, 'unknown targets change nothing');
 });
 
+test('generates stable script ids with a collision suffix', () => {
+    assert.equal(scriptSlug('My Script!'), 'my-script');
+    assert.equal(scriptSlug('   '), 'script', 'an empty name still yields a usable id');
+    assert.equal(scriptIdFor('My Script', []), 'script-my-script');
+    assert.equal(scriptIdFor('My Script', ['script-my-script']), 'script-my-script-2');
+    assert.equal(scriptIdFor('My Script', ['script-my-script', 'script-my-script-2']), 'script-my-script-3');
+    assert.ok(scriptIdFor('a'.repeat(80), []).length <= 48, 'the generated id stays within Core limits');
+});
+
+test('installed entries without metadata still describe cleanly', () => {
+    const rows = describeInstalled([{ id: 'x', entry: 'https://example.com/x.js' }], []);
+    assert.deepEqual(rows[0].permissions, []);
+    assert.deepEqual(rows[0].dependencies, []);
+    assert.equal(rows[0].version, '');
+});
+
 test('describes installed entries with runtime state, including failures', () => {
     const installed = [
-        { id: 'hello-loom', entry: `${BASE}extensions/hello-loom/index.js`, bundled: true },
+        {
+            id: 'hello-loom',
+            entry: `${BASE}extensions/hello-loom/index.js`,
+            bundled: true,
+            version: '0.1.0',
+            permissions: ['host.chat.read'],
+            dependencies: ['loom-host'],
+        },
         { id: 'gone', entry: 'https://example.com/gone.js', bundled: false },
     ];
     const states = [
@@ -87,8 +112,15 @@ test('describes installed entries with runtime state, including failures', () =>
     ];
 
     assert.deepEqual(describeInstalled(installed, states), [
-        { id: 'hello-loom', entry: `${BASE}extensions/hello-loom/index.js`, bundled: true, state: 'active', name: 'Hello Loom', error: '' },
-        { id: 'gone', entry: 'https://example.com/gone.js', bundled: false, state: 'failed', name: 'Gone', error: 'boom' },
+        {
+            id: 'hello-loom', entry: `${BASE}extensions/hello-loom/index.js`, bundled: true,
+            state: 'active', name: 'Hello Loom', version: '0.1.0',
+            permissions: ['host.chat.read'], dependencies: ['loom-host'], error: '',
+        },
+        {
+            id: 'gone', entry: 'https://example.com/gone.js', bundled: false,
+            state: 'failed', name: 'Gone', version: '', permissions: [], dependencies: [], error: 'boom',
+        },
     ]);
     assert.equal(describeInstalled(installed, []).find(entry => entry.id === 'gone').state, 'missing',
         'a recorded id with no runtime state is reported rather than hidden');
