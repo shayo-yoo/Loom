@@ -11,6 +11,7 @@ import {
     locateNode,
     normalizeNode,
     removeNodeAt,
+    serializeNode,
     updateNodeChildren,
     updateNodeProps,
     validateNode,
@@ -121,6 +122,40 @@ test('locates and mutates nodes by path', () => {
     assert.equal(tree.children.length, 1);
     assert.throws(() => removeNodeAt(tree, []), /Cannot remove the root node/);
     assert.throws(() => updateNodeChildren(tree, [0], ['child']), /not a container/);
+});
+
+test('serializes a tree to plain JSON data without handlers', () => {
+    registerDemoComponents();
+    const tree = validateNode({
+        component: 'demo-box',
+        children: [
+            'shorthand',
+            { component: 'demo-button', props: { label: 'Go' }, on: { click: () => {} } },
+        ],
+    });
+
+    const serialized = serializeNode(tree);
+    assert.deepEqual(serialized, {
+        component: 'demo-box',
+        props: {},
+        children: [
+            {
+                component: 'text',
+                props: { text: 'shorthand', variant: 'body', tone: 'default' },
+                children: [],
+            },
+            { component: 'demo-button', props: { label: 'Go' }, children: [] },
+        ],
+    });
+    assert.equal(JSON.stringify(serialized).includes('"on"'), false, 'handlers are dropped');
+    assert.deepEqual(JSON.parse(JSON.stringify(serialized)), serialized, 'output is JSON-safe');
+
+    // Serialization is a deep copy: editing it cannot mutate the mounted tree.
+    serialized.children[1].props.label = 'Changed';
+    assert.equal(tree.children[1].props.label, 'Go');
+
+    assert.deepEqual(serializeNode('hello'), { component: 'text', props: { text: 'hello' }, children: [] });
+    assert.throws(() => serializeNode({ component: 'demo-box', children: 'nope' }), /children must be an array/);
 });
 
 test('emits node events with context and isolates handler failures', async () => {

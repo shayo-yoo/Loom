@@ -16,12 +16,38 @@ export function normalizeNode(node) {
     if (typeof node.component !== 'string' || node.component.trim() === '') {
         throw new TypeError('View node requires a component id.');
     }
-    return {
+    const normalized = {
         component: node.component,
         props: node.props ?? {},
         children: node.children ?? [],
         on: node.on ?? {},
     };
+    // Omitted entirely when absent so unkeyed trees keep their existing shape.
+    if (node.key !== undefined) normalized.key = node.key;
+    return normalized;
+}
+
+function validateKey(key, path) {
+    if (key === undefined) return;
+    if (typeof key === 'string' && key !== '') return;
+    if (typeof key === 'number' && Number.isFinite(key)) return;
+    throw new TypeError(`Node ${path} key must be a non-empty string or a finite number.`);
+}
+
+/**
+ * Sibling keys must be unique: the reconciler matches old and new children by
+ * key, so a duplicate would silently move the wrong element.
+ */
+function validateSiblingKeys(children, path) {
+    const seen = new Set();
+    children.forEach((child, index) => {
+        if (child.key === undefined) return;
+        const key = String(child.key);
+        if (seen.has(key)) {
+            throw new TypeError(`Duplicate node key "${key}" among siblings (at ${path}[${index}]).`);
+        }
+        seen.add(key);
+    });
 }
 
 function validateEvents(definition, on, path) {
@@ -47,6 +73,7 @@ export function validateNode(node, path = 'root') {
     if (!definition) {
         throw new Error(`Unknown component: ${normalized.component} (at ${path}).`);
     }
+    validateKey(normalized.key, path);
     const props = resolveProps(definition, normalized.props);
     validateEvents(definition, normalized.on, path);
 
@@ -57,17 +84,64 @@ export function validateNode(node, path = 'root') {
         throw new TypeError(`Component ${definition.id} is not a container and cannot have children.`);
     }
     const children = normalized.children.map((child, index) => validateNode(child, `${path}[${index}]`));
+    validateSiblingKeys(children, path);
 
-    return { component: definition.id, props, children, on: normalized.on };
+    const validated = { component: definition.id, props, children, on: normalized.on };
+    if (normalized.key !== undefined) validated.key = normalized.key;
+    return validated;
 }
 
 export function describeNode(node) {
     const normalized = normalizeNode(node);
-    return {
+    const description = {
         component: normalized.component,
         props: normalized.props,
         children: normalized.children.map(describeNode),
     };
+    // Only surfaced when present, so unkeyed trees keep their existing shape.
+    if (normalized.key !== undefined) description.key = normalized.key;
+    return description;
+}
+
+function serializeValue(value) {
+    if (typeof value === 'function' || typeof value === 'symbol') return undefined;
+    if (typeof value === 'bigint') {
+        throw new TypeError('View props must be JSON-serializable; bigint is not supported.');
+    }
+    if (value === null || typeof value !== 'object') return value;
+    if (Array.isArray(value)) {
+        return value.map(item => serializeValue(item) ?? null);
+    }
+    const result = {};
+    for (const [key, item] of Object.entries(value)) {
+        const serialized = serializeValue(item);
+        if (serialized !== undefined) result[key] = serialized;
+    }
+    return result;
+}
+
+/**
+ * Turn a node tree into plain JSON-compatible data.
+ *
+ * Event handlers (`on`) are dropped because they are behaviour, not structure;
+ * this is what makes a view round-trippable through `JSON.stringify` for a
+ * future visual editor. Props are deep-copied so editing the serialized output
+ * cannot mutate the mounted tree.
+ */
+export function serializeNode(node) {
+    const normalized = normalizeNode(node);
+    if (!Array.isArray(normalized.children)) {
+        throw new TypeError('View node children must be an array.');
+    }
+    const serialized = {
+        component: normalized.component,
+        props: serializeValue(normalized.props) ?? {},
+        children: normalized.children.map(serializeNode),
+    };
+    // Keys are structure, not behaviour: they survive serialization so a
+    // re-mounted list keeps its identity semantics.
+    if (normalized.key !== undefined) serialized.key = serializeValue(normalized.key);
+    return serialized;
 }
 
 export function locateNode(tree, path) {
@@ -101,6 +175,7 @@ export function updateNodeChildren(tree, path, children) {
         throw new TypeError(`Component ${node.component} is not a container and cannot have children.`);
     }
     node.children = children.map(child => validateNode(child));
+    validateSiblingKeys(node.children, `path[${path.join(',')}]`);
     return node;
 }
 
@@ -111,6 +186,7 @@ export function appendNodeChild(tree, path, child) {
         throw new TypeError(`Component ${node.component} is not a container and cannot have children.`);
     }
     node.children.push(validateNode(child));
+    validateSiblingKeys(node.children, `path[${path.join(',')}]`);
     return node;
 }
 

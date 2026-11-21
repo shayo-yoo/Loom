@@ -97,6 +97,9 @@ export function registerComponent(extensionId, component) {
     if (component.update !== undefined && typeof component.update !== 'function') {
         throw new TypeError('Component update must be a function.');
     }
+    if (component.unmount !== undefined && typeof component.unmount !== 'function') {
+        throw new TypeError('Component unmount must be a function.');
+    }
 
     const props = component.props && typeof component.props === 'object' && !Array.isArray(component.props)
         ? Object.entries(component.props).map(([name, definition]) => normalizeProp(name, definition, component.id))
@@ -113,6 +116,7 @@ export function registerComponent(extensionId, component) {
         events,
         mount: component.mount,
         update: component.update,
+        unmount: component.unmount,
     });
     componentRegistry.set(record.id, record);
     bindCleanup(extensionId);
