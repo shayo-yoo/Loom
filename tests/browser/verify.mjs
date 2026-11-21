@@ -400,14 +400,22 @@ async function probeConsent(cdp) {
     assertThat('consent card names the declaring capability', String(cardText).includes('loom-host:worlds.entry.update'));
 
     const approved = await cdp.evaluate(`const root = document.getElementById('loom_consent');
-        const button = [...root.querySelectorAll('button')].find(node => node.textContent.trim() === '允许');
+        // The card lists every pending request (bundled packages may request
+        // permissions too), so click the button inside the probe's own block.
+        const blocks = [...root.querySelectorAll('section, div')]
+            .filter(node => node.textContent.includes('Verify Probe') && node.querySelectorAll('button').length === 2);
+        const block = blocks[0];
+        const button = block ? [...block.querySelectorAll('button')].find(node => node.textContent.trim() === '允许') : null;
         if (!button) return { found: false };
         button.click();
         return { found: true, granted: window.Loom.checkPermission('verify-probe', 'host.worldinfo.write') };`);
     assertThat('approving through the prompt grants the permission', approved.found && approved.granted === true, JSON.stringify(approved));
 
     const cleared = await cdp.waitFor(`const root = document.getElementById('loom_consent');
-        return !root || root.hidden || root.querySelectorAll('button').length === 0 ? 'hidden' : false;`,
+        if (!root) return 'hidden';
+        const blocks = [...root.querySelectorAll('section, div')]
+            .filter(node => node.textContent.includes('Verify Probe') && node.querySelectorAll('button').length === 2);
+        return blocks.length === 0 ? 'hidden' : false;`,
     5_000, 'consent card cleared after approval');
     assertThat('consent card clears after approval', cleared === 'hidden');
 
@@ -420,12 +428,16 @@ async function probeConsent(cdp) {
         return Boolean(root && !root.hidden && root.textContent.includes('host.chat.read'));`, 8_000, 'deny prompt');
 
     const denied = await cdp.evaluate(`const root = document.getElementById('loom_consent');
-        const button = [...root.querySelectorAll('button')].find(node => node.textContent.trim() === '拒绝');
+        const blocks = [...root.querySelectorAll('section, div')]
+            .filter(node => node.textContent.includes('Verify Probe') && node.querySelectorAll('button').length === 2);
+        const block = blocks[0];
+        const button = block ? [...block.querySelectorAll('button')].find(node => node.textContent.trim() === '拒绝') : null;
         if (!button) return { found: false };
         button.click();
         return { found: true, granted: window.Loom.checkPermission('verify-probe', 'host.chat.read') };`);
     assertThat('denying through the prompt leaves the permission unheld', denied.found && denied.granted === false, JSON.stringify(denied));
-    assertThat('denial leaves no open request', (await cdp.evaluate('return window.Loom.listPermissionRequests().length;')) === 0);
+    const probeRequests = await cdp.evaluate("return window.Loom.listPermissionRequests().filter(entry => entry.extensionId === 'verify-probe').length;");
+    assertThat('denial leaves no open probe request', probeRequests === 0, `probe requests=${probeRequests}`);
 }
 
 const SCRATCH_CHAR = '__loom_verify_char__';
@@ -1266,6 +1278,90 @@ async function probeExtensionInstall(cdp) {
         JSON.stringify(removed));
 }
 
+const WBM_BOOK = '__loom_verify_wbm__';
+
+async function probeWorldBookManager(cdp) {
+    // The bundled manager ships with Loom and is user-visible: it must be active,
+    // open from its launcher, list a real book, and save an edit through its UI.
+    const ready = await cdp.waitFor(
+        "return window.Loom?.getExtensionState('world-book-manager')?.state === 'active' ? true : false;",
+        SETTLE_TIMEOUT_MS, 'world-book-manager active',
+    );
+    assertThat('the bundled world-book manager activates', ready === true);
+
+    const launcher = await cdp.evaluate(`return {
+        button: Boolean(document.getElementById('loom_wbm_button')),
+        panel: Boolean(document.getElementById('loom_wbm_panel')),
+        hidden: document.getElementById('loom_wbm_panel')?.style.display === 'none',
+    };`);
+    assertThat('the manager launcher and panel are mounted',
+        launcher.button === true && launcher.panel === true && launcher.hidden === true,
+        JSON.stringify(launcher));
+
+    // Prepare a scratch book with one entry, then drive the manager's real DOM.
+    const scratch = await cdp.evaluate(`const Loom = window.Loom;
+        // The install probe reloads the page, which drops dynamically registered
+        // extensions; the harness registers its probe again where needed.
+        if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) {
+            Loom.registerExtension({ id: 'verify-probe', name: 'Verify Probe' });
+        }
+        if (!Loom.checkPermission('verify-probe', 'host.worldinfo.manage')) Loom.grantPermission('verify-probe', 'host.worldinfo.manage');
+        const created = await Loom.executeCapability('loom-host', 'worlds.create', { name: ${JSON.stringify(WBM_BOOK)} }, { caller: 'verify-probe' });
+        const entry = await Loom.executeCapability('loom-host', 'worlds.entry.create',
+            { name: ${JSON.stringify(WBM_BOOK)}, entry: { comment: 'manager probe', content: 'original content', keys: ['probe'] } },
+            { caller: 'verify-probe' });
+        // A declared permission is requested at activation; granting it here is
+        // what the user does in the consent prompt.
+        Loom.grantPermission('world-book-manager', 'host.worldinfo.write');
+        document.getElementById('loom_wbm_button').click();
+        return { created: created.success === true, entry: entry.success === true, error: created.error?.code ?? entry.error?.code ?? null };`);
+    assertThat('the scratch book for the manager is ready', scratch.created === true && scratch.entry === true, JSON.stringify(scratch));
+
+    const opened = await cdp.waitFor(
+        `const panel = document.getElementById('loom_wbm_panel');
+        if (!panel) return false;
+        const select = panel.querySelector('select');
+        return select && [...select.options].some(option => option.value === ${JSON.stringify(WBM_BOOK)})
+            ? { options: [...select.options].length } : false;`,
+        SETTLE_TIMEOUT_MS, 'manager listing the scratch book',
+    );
+    assertThat('the manager lists the scratch book', Boolean(opened) && opened.options >= 1, JSON.stringify(opened));
+
+    const edited = await cdp.evaluate(`const panel = document.getElementById('loom_wbm_panel');
+        const selects = panel.querySelectorAll('select');
+        const bookSelect = selects[0];
+        bookSelect.value = ${JSON.stringify(WBM_BOOK)};
+        bookSelect.dispatchEvent(new Event('change'));
+        await new Promise(resolve => setTimeout(resolve, 400));
+        const entrySelect = panel.querySelectorAll('select')[1];
+        if (!entrySelect || entrySelect.options.length === 0) return { ok: false, reason: 'no entries listed' };
+        entrySelect.value = entrySelect.options[0].value;
+        entrySelect.dispatchEvent(new Event('change'));
+        await new Promise(resolve => setTimeout(resolve, 300));
+        const textarea = panel.querySelector('textarea');
+        if (!textarea) return { ok: false, reason: 'no textarea' };
+        textarea.value = 'edited through the manager';
+        textarea.dispatchEvent(new Event('change'));
+        const save = [...panel.querySelectorAll('button')].find(button => button.textContent === '保存');
+        if (!save) return { ok: false, reason: 'no save button' };
+        save.click();
+        await new Promise(resolve => setTimeout(resolve, 600));
+        return { ok: true, status: panel.textContent.includes('已保存'), text: panel.textContent.slice(-200) };`);
+    assertThat('the manager drives a real save through its UI',
+        edited.ok === true && edited.status === true, JSON.stringify(edited));
+
+    const persisted = await cdp.evaluate(`return await window.Loom.executeCapability('loom-host', 'worlds.entries',
+        { name: ${JSON.stringify(WBM_BOOK)} }, { caller: 'verify-probe' });`);
+    assertThat('the manager edit reached the world book',
+        persisted.success === true
+        && (persisted.data ?? []).some(entry => entry.content === 'edited through the manager'),
+        JSON.stringify(persisted.data ?? persisted.error));
+
+    const closed = await cdp.evaluate(`document.getElementById('loom_wbm_button').click();
+        return document.getElementById('loom_wbm_panel').style.display === 'none';`);
+    assertThat('the manager panel closes from its launcher', closed === true);
+}
+
 async function probeWorldRename(cdp) {
     await cdp.evaluate(`const Loom = window.Loom;
         if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) Loom.loadExtension({ id: 'verify-probe', name: 'Verify Probe' });
@@ -1429,7 +1525,7 @@ async function cleanup(cdp) {
             window.SillyTavern.getContext().saveSettingsDebounced();
             return true;`);
         // A failed probe could leave a scratch book behind.
-        for (const name of [SCRATCH_BOOK, SCRATCH_COPY, RENAME_SRC, RENAME_DST]) {
+        for (const name of [SCRATCH_BOOK, SCRATCH_COPY, RENAME_SRC, RENAME_DST, WBM_BOOK]) {
             if (await scratchBookExists(cdp, name)) await deleteScratchBook(cdp, name);
         }
         // Wait for the debounced save to flush before the browser is killed.
@@ -1499,6 +1595,7 @@ async function main() {
         await runProbe('world export/import', probeWorldExportImport, cdp);
         await runProbe('world rename', probeWorldRename, cdp);
         await runProbe('extension install', probeExtensionInstall, cdp);
+        await runProbe('world-book manager', probeWorldBookManager, cdp);
         await runProbe('character write', probeCharacterWrite, cdp);
         await runProbe('chat mutation', probeChatMutation, cdp);
         await runProbe('reload restore', probeReloadRestore, cdp);

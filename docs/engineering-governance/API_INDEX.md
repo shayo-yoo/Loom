@@ -167,6 +167,8 @@ Whole-book lifecycle (destructive, hence a separate permission):
 
 All host capabilities return mapped primitives rather than host objects. When SillyTavern is unavailable (for example outside the browser), calls fail with a structured host-unavailable error.
 
+`Loom UI` exposes 17 built-in components: `text`, `button` (`label`), `input`, `textarea` (`value`, `placeholder`, `rows`, `disabled`; emits `change` on blur), `toggle`, `select` (options accept strings or `{ value, label }`), `card`, `row`, `column`, `grid`, `divider`, `list`, `badge`, `image`, `tabs`, `modal`, `menu`. Event handlers receive `{ event, payload, path, viewId, extensionId }`; `select`/`input`/`textarea`/`toggle` put the new value in `payload`. View nodes are `{ component, props?, children?, on?, key? }`; `path` for `setProps`/`setChildren` is an array of child indexes from the root.
+
 ## Extension Packages and Installation
 
 A Loom extension package is a directory `extensions/<id>/` with `manifest.json` (`id`/`name`/`version`/`entry`, optional `dependencies`/`permissions`) and the entry module. `npm run extensions:index` writes the deterministic `extensions/index.json` that the browser reads.

@@ -10,6 +10,18 @@
       "entry": "extensions/hello-loom/index.js",
       "dependencies": [],
       "permissions": []
+    },
+    {
+      "id": "world-book-manager",
+      "name": "世界书管理器",
+      "version": "0.1.0",
+      "description": "浏览世界书、编辑条目内容与启用状态，并显示真实保存结果。",
+      "manifest": "extensions/world-book-manager/manifest.json",
+      "entry": "extensions/world-book-manager/index.js",
+      "dependencies": [],
+      "permissions": [
+        "host.worldinfo.write"
+      ]
     }
   ]
 }

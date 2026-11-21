@@ -25,6 +25,76 @@ afterEach(() => {
     dom.uninstall();
 });
 
+test('select accepts plain strings and value/label options', () => {
+    const view = createView(owner, {
+        root: {
+            component: 'select',
+            props: { options: ['plain', { value: '12', label: '条目 12' }], value: 'plain' },
+        },
+    });
+
+    const select = view.element;
+    const options = [...select.querySelectorAll('option')];
+    assert.equal(options.length, 2);
+    assert.equal(options[0].value, 'plain');
+    assert.equal(options[0].textContent, 'plain');
+    assert.equal(options[1].value, '12');
+    assert.equal(options[1].textContent, '条目 12');
+    assert.equal(select.value, 'plain');
+
+    view.setProps([], { options: [{ value: 'a', label: 'A' }], value: 'a' });
+    const updated = [...view.element.querySelectorAll('option')];
+    assert.equal(updated.length, 1);
+    assert.equal(updated[0].textContent, 'A');
+    assert.equal(view.element.value, 'a');
+});
+
+test('textarea edits long text and emits its value on change', () => {
+    const view = createView(owner, {
+        root: {
+            component: 'textarea',
+            props: { value: 'first', placeholder: '写下内容', rows: 8 },
+        },
+    });
+
+    const textarea = view.element;
+    assert.equal(textarea.tagName, 'TEXTAREA');
+    assert.equal(textarea.value, 'first');
+    assert.equal(textarea.placeholder, '写下内容');
+    assert.equal(textarea.rows, 8);
+
+    let emitted = null;
+    view.setProps([], {
+        value: 'first',
+        placeholder: '写下内容',
+        rows: 8,
+    });
+    view.element.value = 'typed by user';
+    view.element.dispatchEvent(createEvent('change'));
+    assert.equal(view.element.value, 'typed by user', 'a changed value survives a props update');
+
+    view.setProps([], { value: 'declared', placeholder: 'x', rows: 3 });
+    assert.equal(view.element.value, 'declared', 'a real prop change is applied');
+    assert.equal(view.element.rows, 3);
+    assert.equal(emitted, null);
+});
+
+test('textarea emits the edited value through its change handler', () => {
+    let received = null;
+    createView(owner, {
+        root: {
+            component: 'textarea',
+            props: { value: '' },
+            on: { change: event => { received = event; } },
+        },
+    });
+
+    const textarea = document.querySelector('textarea');
+    textarea.value = 'hello textarea';
+    textarea.dispatchEvent(createEvent('change'));
+    assert.deepEqual(received.payload, { value: 'hello textarea' });
+});
+
 test('new components are registered as short names with props, containers and events', () => {
     const byId = new Map(BUILTIN_COMPONENTS.map(component => [component.id, component]));
 

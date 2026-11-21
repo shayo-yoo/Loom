@@ -1,7 +1,7 @@
 import '../Loom%20Core/index.js';
 
 const EXTENSION_ID = 'loom-host';
-const HOST_VERSION = '0.26.0';
+const HOST_VERSION = '0.27.0';
 const runtime = globalThis.Loom;
 
 const nullInput = { type: 'null' };

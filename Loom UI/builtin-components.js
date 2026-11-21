@@ -58,6 +58,33 @@ function updateInput(element, props) {
     element.disabled = props.disabled;
 }
 
+function clampRows(value) {
+    const rows = Number.isFinite(value) ? Math.round(value) : 6;
+    return Math.min(40, Math.max(1, rows));
+}
+
+function createTextarea(props, context) {
+    const element = document.createElement('textarea');
+    element.className = 'loom-textarea text_pole';
+    element.value = props.value;
+    element.placeholder = props.placeholder;
+    element.rows = clampRows(props.rows);
+    element.disabled = props.disabled;
+    // Long-form text is usually edited continuously, but `change` on a textarea
+    // fires on blur; emitting `change` keeps the contract identical to `input`.
+    element.addEventListener('change', () => context.emit('change', { value: element.value }));
+    return element;
+}
+
+function updateTextarea(element, props) {
+    // Do not clobber what the user is typing: only write when the declared value
+    // actually differs from the field.
+    if (element.value !== props.value) element.value = props.value;
+    element.placeholder = props.placeholder;
+    element.rows = clampRows(props.rows);
+    element.disabled = props.disabled;
+}
+
 function createToggle(props, context) {
     const label = document.createElement('label');
     label.className = 'loom-toggle';
@@ -78,15 +105,27 @@ function updateToggle(element, props) {
     if (span) span.textContent = props.label;
 }
 
+/**
+ * An option is either a plain string or `{ value, label }`.
+ *
+ * The object form exists because callers often need to show a readable label
+ * while keeping a stable machine value (an id, a uid).
+ */
+function appendOptions(element, options) {
+    for (const option of options) {
+        const item = document.createElement('option');
+        const value = option && typeof option === 'object' ? option.value : option;
+        const label = option && typeof option === 'object' ? (option.label ?? option.value) : option;
+        item.value = String(value);
+        item.textContent = String(label);
+        element.append(item);
+    }
+}
+
 function createSelect(props, context) {
     const element = document.createElement('select');
     element.className = 'loom-select text_pole';
-    for (const option of props.options) {
-        const item = document.createElement('option');
-        item.value = String(option);
-        item.textContent = String(option);
-        element.append(item);
-    }
+    appendOptions(element, props.options);
     element.value = props.value;
     element.addEventListener('change', () => context.emit('change', { value: element.value }));
     return element;
@@ -94,12 +133,7 @@ function createSelect(props, context) {
 
 function updateSelect(element, props) {
     element.replaceChildren();
-    for (const option of props.options) {
-        const item = document.createElement('option');
-        item.value = String(option);
-        item.textContent = String(option);
-        element.append(item);
-    }
+    appendOptions(element, props.options);
     element.value = props.value;
 }
 
@@ -633,6 +667,20 @@ export const BUILTIN_COMPONENTS = Object.freeze([
         },
         mount: createInput,
         update: updateInput,
+    },
+    {
+        id: 'textarea',
+        name: '多行输入',
+        description: '多行文本输入框，触发 change 事件。',
+        events: ['change'],
+        props: {
+            value: { type: 'string', default: '' },
+            placeholder: { type: 'string', default: '' },
+            rows: { type: 'number', default: 6 },
+            disabled: { type: 'boolean', default: false },
+        },
+        mount: createTextarea,
+        update: updateTextarea,
     },
     {
         id: 'toggle',
