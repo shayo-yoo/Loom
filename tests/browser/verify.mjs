@@ -22,7 +22,7 @@
 
 import { spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -397,7 +397,46 @@ async function probeConsent(cdp) {
     assertThat('denial leaves no open request', (await cdp.evaluate('return window.Loom.listPermissionRequests().length;')) === 0);
 }
 
+const SCRATCH_CHAR = '__loom_verify_char__';
 const SCRATCH_BOOK = '__loom_verify_scratch__';
+const CHARACTERS_DIR = path.join('D:\\1\\APP\\SillyTavern', 'data', 'default-user', 'characters');
+
+/**
+ * Read the TavernCard JSON embedded in a character PNG's `chara` tEXt chunk.
+ *
+ * SillyTavern stores the card as base64-encoded UTF-8 JSON, so the chunk value
+ * has to be decoded before it can be parsed.
+ */
+function readCardFromPng(file) {
+    const buffer = readFileSync(file);
+    let offset = 8; // PNG signature
+    while (offset + 8 <= buffer.length) {
+        const length = buffer.readUInt32BE(offset);
+        const type = buffer.toString('ascii', offset + 4, offset + 8);
+        const dataStart = offset + 8;
+        if (type === 'tEXt') {
+            const payload = buffer.subarray(dataStart, dataStart + length);
+            const separator = payload.indexOf(0);
+            if (payload.toString('latin1', 0, separator) === 'chara') {
+                const text = payload.toString('latin1', separator + 1);
+                return JSON.parse(Buffer.from(text, 'base64').toString('utf8'));
+            }
+        } else if (type === 'iTXt') {
+            const payload = buffer.subarray(dataStart, dataStart + length);
+            const separator = payload.indexOf(0);
+            if (payload.toString('latin1', 0, separator) === 'chara') {
+                const rest = payload.subarray(separator + 1);
+                const textStart = rest.indexOf(Buffer.from([0, 0])) + 2;
+                const afterLang = rest.subarray(textStart);
+                const langEnd = afterLang.indexOf(0);
+                const translatedEnd = afterLang.indexOf(0, langEnd + 1);
+                return JSON.parse(Buffer.from(afterLang.toString('utf8', translatedEnd + 1), 'base64').toString('utf8'));
+            }
+        }
+        offset = dataStart + length + 4; // + CRC
+    }
+    throw new Error(`No chara chunk in ${file}`);
+}
 const SCRATCH_COPY = '__loom_verify_copy__';
 const RENAME_SRC = '__loom_verify_rename_src__';
 const RENAME_DST = '__loom_verify_rename_dst__';
@@ -912,6 +951,94 @@ async function probeChatWrite(cdp) {
     }
 }
 
+async function probeCharacterWrite(cdp) {
+    const cardPath = path.join(CHARACTERS_DIR, `${SCRATCH_CHAR}.png`);
+    let created = null;
+    try {
+        // Create a real PNG card through the host API: the write under test only
+        // proves something if it lands in the `chara` tEXt chunk on disk.
+        created = await cdp.evaluate(`const context = window.SillyTavern.getContext();
+            const response = await fetch('/api/characters/create', {
+                method: 'POST',
+                headers: context.getRequestHeaders(),
+                body: JSON.stringify({
+                    ch_name: ${JSON.stringify(SCRATCH_CHAR)},
+                    file_name: ${JSON.stringify(SCRATCH_CHAR)},
+                    description: 'original text',
+                    personality: '',
+                    scenario: '',
+                    first_mes: 'hello',
+                    mes_example: '',
+                    creator_notes: '',
+                }),
+            });
+            return { ok: response.ok, avatar: response.ok ? await response.text() : null };`);
+        assertThat('character scratch card created',
+            created.ok === true && created.avatar === `${SCRATCH_CHAR}.png`, JSON.stringify(created));
+        if (created.ok !== true) return;
+
+        // The host's in-memory character list does not include a card until it
+        // reloads, and `characters.update` resolves against that list.
+        await cdp.evaluate(`await window.SillyTavern.getContext().getCharacters();
+            return true;`);
+
+        const original = readCardFromPng(cardPath);
+        assertThat('the scratch card starts with the original text',
+            original.description === 'original text' && original.first_mes === 'hello',
+            JSON.stringify({ description: original.description, first_mes: original.first_mes }));
+
+        await cdp.evaluate(`const Loom = window.Loom;
+            if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) {
+                Loom.loadExtension({ id: 'verify-probe', name: 'Browser verification probe' });
+            }
+            if (!Loom.checkPermission('verify-probe', 'host.characters.write')) {
+                Loom.grantPermission('verify-probe', 'host.characters.write');
+            }
+            return true;`);
+
+        const updated = await cdp.evaluate(`return await window.Loom.executeCapability('loom-host', 'characters.update', {
+            name: ${JSON.stringify(SCRATCH_CHAR)},
+            patch: { description: 'edited by Loom', firstMessage: 'edited first', tags: ['loom', 'verified'] },
+        }, { caller: 'verify-probe' });`);
+        assertThat('characters.update writes the card',
+            updated.success === true && updated.data.refreshed === true,
+            JSON.stringify(updated.data ?? updated.error));
+
+        // `merge-attributes` deep-merges into the card's V2 `data` block (the
+        // canonical store); SillyTavern normalises that block over the legacy
+        // top-level copy whenever it reads the card.
+        const written = readCardFromPng(cardPath);
+        assertThat('the PNG now carries the edited text',
+            written.data?.description === 'edited by Loom'
+            && written.data?.first_mes === 'edited first'
+            && written.data?.mes_example === ''
+            && Array.isArray(written.data?.tags)
+            && written.data.tags.includes('verified'),
+            JSON.stringify({ description: written.data?.description, first_mes: written.data?.first_mes, tags: written.data?.tags }));
+
+        const memory = await cdp.evaluate(`const context = window.SillyTavern.getContext();
+            const character = (context.characters ?? []).find(item => item.avatar === ${JSON.stringify(created.avatar)});
+            return character ? { description: character.description, tags: character.tags } : null;`);
+        assertThat('the in-memory copy is refreshed after the write',
+            memory?.description === 'edited by Loom' && (memory.tags ?? []).includes('verified'),
+            JSON.stringify(memory));
+    } finally {
+        if (created?.ok === true) {
+            await cdp.evaluate(`const context = window.SillyTavern.getContext();
+                await fetch('/api/characters/delete', {
+                    method: 'POST',
+                    headers: context.getRequestHeaders(),
+                    body: JSON.stringify({ avatar_url: ${JSON.stringify(created.avatar)}, delete_chats: false }),
+                });
+                return true;`);
+            await rm(path.join('D:\\1\\APP\\SillyTavern', 'data', 'default-user', 'chats', SCRATCH_CHAR),
+                { recursive: true, force: true });
+            await cdp.evaluate(`return await window.Loom.revokePermission('verify-probe', 'host.characters.write');`);
+            assertThat('the scratch character is deleted', existsSync(cardPath) === false, cardPath);
+        }
+    }
+}
+
 async function probeWorldRename(cdp) {
     await cdp.evaluate(`const Loom = window.Loom;
         if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) Loom.loadExtension({ id: 'verify-probe', name: 'Verify Probe' });
@@ -1133,6 +1260,7 @@ async function main() {
         await runProbe('world write', probeWorldWrite, cdp);
         await runProbe('world export/import', probeWorldExportImport, cdp);
         await runProbe('world rename', probeWorldRename, cdp);
+        await runProbe('character write', probeCharacterWrite, cdp);
         await runProbe('reload restore', probeReloadRestore, cdp);
 
         const loomErrors = consoleErrors.filter(message => /loom/i.test(message));

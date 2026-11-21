@@ -1030,6 +1030,153 @@ const characterCardCapability = {
     },
 };
 
+const CHARACTERS_WRITE_SCOPE = 'host.characters.write';
+const CHARACTER_FIELD_LIMIT = 100_000;
+const CHARACTER_TAG_LIMIT = 50;
+
+/**
+ * Caller-facing field names → SillyTavern card keys.
+ *
+ * The list is a whitelist on purpose: `merge-attributes` deep-merges whatever it
+ * is given into the card, so an unvetted field could rewrite `avatar`, the
+ * `extensions` block or the embedded `character_book`. Renaming a card and
+ * editing its image are separate operations that Loom does not offer.
+ */
+const CHARACTER_PATCH_FIELDS = Object.freeze({
+    description: 'description',
+    personality: 'personality',
+    scenario: 'scenario',
+    firstMessage: 'first_mes',
+    exampleMessages: 'mes_example',
+    creatorNotes: 'creator_notes',
+    systemPrompt: 'system_prompt',
+    postHistoryInstructions: 'post_history_instructions',
+});
+
+const characterPatchProperties = Object.freeze({
+    description: { type: 'string', maxLength: CHARACTER_FIELD_LIMIT },
+    personality: { type: 'string', maxLength: CHARACTER_FIELD_LIMIT },
+    scenario: { type: 'string', maxLength: CHARACTER_FIELD_LIMIT },
+    firstMessage: { type: 'string', maxLength: CHARACTER_FIELD_LIMIT },
+    exampleMessages: { type: 'string', maxLength: CHARACTER_FIELD_LIMIT },
+    creatorNotes: { type: 'string', maxLength: CHARACTER_FIELD_LIMIT },
+    systemPrompt: { type: 'string', maxLength: CHARACTER_FIELD_LIMIT },
+    postHistoryInstructions: { type: 'string', maxLength: CHARACTER_FIELD_LIMIT },
+    tags: {
+        type: 'array',
+        maxItems: CHARACTER_TAG_LIMIT,
+        items: { type: 'string', minLength: 1, maxLength: 100 },
+    },
+});
+
+function findCharacter(context, name) {
+    const characters = context.characters;
+    if (!Array.isArray(characters)) return null;
+    const wanted = String(name).trim().toLowerCase();
+    return characters.find(item => (
+        String(item?.name ?? '').toLowerCase() === wanted
+        || String(item?.avatar ?? '').toLowerCase() === wanted
+    )) ?? null;
+}
+
+/**
+ * Write character-card fields.
+ *
+ * The card lives inside the PNG's `chara` chunk; SillyTavern's
+ * `/api/characters/merge-attributes` is the only writing path it offers (a deep
+ * merge that validates the result against the TavernCard V2 spec and refuses to
+ * write an invalid card), so the adapter uses it and then refreshes the host's
+ * in-memory copy with `getOneCharacter`. Without that refresh the UI would keep
+ * showing the old text while the file already changed.
+ */
+const charactersUpdateCapability = {
+    id: 'characters.update',
+    name: '更新角色卡',
+    description: '按角色名或头像文件名更新角色卡文本字段与标签（写入 PNG，需要 host.characters.write 授权）。',
+    permissions: [CHARACTERS_WRITE_SCOPE],
+    input: {
+        type: 'object',
+        required: ['name', 'patch'],
+        properties: {
+            name: { type: 'string', minLength: 1, maxLength: 200 },
+            patch: {
+                type: 'object',
+                required: [],
+                properties: characterPatchProperties,
+                additionalProperties: false,
+            },
+        },
+        additionalProperties: false,
+    },
+    output: {
+        type: 'object',
+        required: ['avatar', 'name', 'updated', 'refreshed'],
+        properties: {
+            avatar: { type: 'string' },
+            name: { type: 'string' },
+            updated: { type: 'array', items: { type: 'string' } },
+            refreshed: { type: 'boolean' },
+        },
+        additionalProperties: false,
+    },
+    execute: async (input) => {
+        const context = getHostContext();
+        const character = findCharacter(context, input.name);
+        if (!character) {
+            throw typedError('CHARACTER_NOT_FOUND', `Character not found: ${input.name}`);
+        }
+        const avatar = String(character.avatar ?? '');
+        if (!avatar) {
+            throw typedError('CHARACTER_NOT_FOUND', `Character has no avatar file: ${input.name}`);
+        }
+
+        const patch = input.patch ?? {};
+        const updated = Object.keys(patch);
+        if (updated.length === 0) {
+            throw typedError('INVALID_INPUT', 'Character patch must contain at least one field.');
+        }
+        if (typeof globalThis.fetch !== 'function') {
+            throw typedError('HOST_UNSUPPORTED', 'This environment has no fetch() for character writes.');
+        }
+
+        const data = {};
+        for (const field of updated) {
+            if (field === 'tags') data.tags = [...patch.tags];
+            else data[CHARACTER_PATCH_FIELDS[field]] = patch[field];
+        }
+
+        const headers = { 'Content-Type': 'application/json', ...(context.getRequestHeaders?.() ?? {}) };
+        let response;
+        try {
+            response = await globalThis.fetch('/api/characters/merge-attributes', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ avatar, data }),
+            });
+        } catch (error) {
+            throw typedError('HOST_UNSUPPORTED', `Character write failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (!response || response.ok === false) {
+            // The host refuses to write a card that fails V2 validation; the file is
+            // untouched, so this is a rejection rather than a partial write.
+            throw typedError('CHARACTER_WRITE_FAILED', `SillyTavern rejected the character write (status ${response?.status ?? 'unknown'}).`, {
+                avatar,
+            });
+        }
+
+        let refreshed = false;
+        if (typeof context.getOneCharacter === 'function') {
+            try {
+                await context.getOneCharacter(avatar);
+                refreshed = true;
+            } catch {
+                refreshed = false;
+            }
+        }
+        return { avatar, name: String(character.name ?? ''), updated: updated.sort(), refreshed };
+    },
+};
+
 const viewportCapability = {
     id: 'viewport.get',
     name: '视口信息',
@@ -1397,6 +1544,7 @@ const CAPABILITIES = Object.freeze([
     snapshotCapability,
     charactersCapability,
     characterCardCapability,
+    charactersUpdateCapability,
     worldsCapability,
     worldsCreateCapability,
     worldsRemoveCapability,

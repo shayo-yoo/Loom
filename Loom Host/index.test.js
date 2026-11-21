@@ -109,6 +109,7 @@ test('registers the host adapter and its capabilities', () => {
         [
             'characters.get',
             'characters.list',
+            'characters.update',
             'chat.append',
             'chat.messages',
             'context.snapshot',
@@ -154,6 +155,8 @@ test('declares the write permission only on the mutating settings capabilities',
     assert.deepEqual(declared['worlds.remove'], ['host.worldinfo.manage']);
     assert.deepEqual(declared['worlds.import'], ['host.worldinfo.manage']);
     assert.deepEqual(declared['worlds.rename'], ['host.worldinfo.manage']);
+    assert.deepEqual(declared['characters.update'], ['host.characters.write']);
+    assert.deepEqual(declared['characters.get'], [], 'reading a card stays ungated');
     assert.deepEqual(declared['worlds.export'], [], 'export is a read');
     assert.deepEqual(declared['characters.get'], []);
 });
@@ -607,6 +610,124 @@ test('whole-book writes prefer the host writer so its cache stays correct', asyn
         assert.equal(fetches, 0);
     } finally {
         globalThis.fetch = originalFetch;
+    }
+});
+
+function stubCharacterHost(options = {}) {
+    const requests = [];
+    const refreshed = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (path, init) => {
+        requests.push({ path, body: JSON.parse(init.body) });
+        if (options.fail) return { ok: false, status: 400 };
+        return { ok: true, status: 200 };
+    };
+    stubHost({
+        chat: [],
+        characters: options.characters ?? [{ name: 'Alice', avatar: 'alice.png' }],
+        getRequestHeaders: () => ({ 'X-Test': '1' }),
+        getOneCharacter: async avatar => { refreshed.push(avatar); },
+    });
+    return { requests, refreshed, restore: () => { globalThis.fetch = originalFetch; } };
+}
+
+test('updates character card fields through merge-attributes', async () => {
+    const host = stubCharacterHost();
+    registerConsumer();
+    grantPermission(consumerId, 'host.characters.write');
+    try {
+        const result = await executeCapability(EXTENSION_ID, 'characters.update', {
+            name: 'Alice',
+            patch: { description: 'new desc', firstMessage: 'hi', tags: ['a', 'b'] },
+        }, { caller: consumerId });
+
+        assert.deepEqual(result, {
+            success: true,
+            data: { avatar: 'alice.png', name: 'Alice', updated: ['description', 'firstMessage', 'tags'], refreshed: true },
+        });
+        assert.deepEqual(host.requests, [{
+            path: '/api/characters/merge-attributes',
+            body: { avatar: 'alice.png', data: { description: 'new desc', first_mes: 'hi', tags: ['a', 'b'] } },
+        }], 'caller-facing names map onto the host card keys');
+        assert.deepEqual(host.refreshed, ['alice.png'], 'the host memory copy is refreshed after the write');
+    } finally {
+        host.restore();
+    }
+});
+
+test('characters.update is gated and cannot be confused with reading', async () => {
+    const host = stubCharacterHost();
+    registerConsumer();
+    try {
+        const denied = await executeCapability(EXTENSION_ID, 'characters.update',
+            { name: 'Alice', patch: { description: 'x' } }, { caller: consumerId });
+        assert.equal(denied.error.code, 'PERMISSION_DENIED');
+        assert.deepEqual(denied.error.details.missing, ['host.characters.write']);
+        assert.deepEqual(host.requests, []);
+    } finally {
+        host.restore();
+    }
+});
+
+test('characters.update rejects unknown or empty patches before writing', async () => {
+    const host = stubCharacterHost();
+    registerConsumer();
+    grantPermission(consumerId, 'host.characters.write');
+    try {
+        const empty = await executeCapability(EXTENSION_ID, 'characters.update',
+            { name: 'Alice', patch: {} }, { caller: consumerId });
+        assert.equal(empty.error.code, 'INVALID_INPUT');
+
+        // Structural fields are not offered: they would rewrite the card image or
+        // embedded world book.
+        for (const field of ['avatar', 'name', 'extensions', 'character_book', 'data']) {
+            const result = await executeCapability(EXTENSION_ID, 'characters.update',
+                { name: 'Alice', patch: { [field]: 'x' } }, { caller: consumerId });
+            assert.equal(result.error.code, 'INVALID_INPUT', `${field} must not be patchable`);
+        }
+        assert.deepEqual(host.requests, []);
+    } finally {
+        host.restore();
+    }
+});
+
+test('characters.update reports a missing character and a rejected write', async () => {
+    const host = stubCharacterHost({ fail: true });
+    registerConsumer();
+    grantPermission(consumerId, 'host.characters.write');
+    try {
+        const missing = await executeCapability(EXTENSION_ID, 'characters.update',
+            { name: 'Nobody', patch: { description: 'x' } }, { caller: consumerId });
+        assert.equal(missing.error.code, 'CHARACTER_NOT_FOUND');
+
+        const rejected = await executeCapability(EXTENSION_ID, 'characters.update',
+            { name: 'Alice', patch: { description: 'x' } }, { caller: consumerId });
+        assert.equal(rejected.error.code, 'CHARACTER_WRITE_FAILED');
+        assert.deepEqual(rejected.error.details, { avatar: 'alice.png' });
+        assert.deepEqual(host.refreshed, [], 'nothing is refreshed when the host refused the write');
+    } finally {
+        host.restore();
+    }
+});
+
+test('characters.update reports a stale memory copy when refresh fails', async () => {
+    const host = stubCharacterHost();
+    globalThis.SillyTavern.getContext = () => ({
+        chat: [],
+        characters: [{ name: 'Alice', avatar: 'alice.png' }],
+        getRequestHeaders: () => ({}),
+        getOneCharacter: async () => { throw new Error('refresh failed'); },
+    });
+    registerConsumer();
+    grantPermission(consumerId, 'host.characters.write');
+    try {
+        const result = await executeCapability(EXTENSION_ID, 'characters.update',
+            { name: 'Alice', patch: { description: 'x' } }, { caller: consumerId });
+        assert.equal(result.success, true, 'the file was written even if the memory refresh failed');
+        assert.equal(result.data.refreshed, false, 'the caller is told the in-memory copy is stale');
+        assert.equal(host.requests.length, 1);
+    } finally {
+        host.restore();
     }
 });
 
