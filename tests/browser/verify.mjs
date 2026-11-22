@@ -1642,6 +1642,81 @@ async function probeButtonLayout(cdp) {
         JSON.stringify({ permission: layout.permission, install: layout.install }));
 }
 
+async function probePanelSections(cdp) {
+    const sections = await cdp.evaluate(`document.getElementById('loom_extension_button')?.click();
+        await new Promise(resolve => setTimeout(resolve, 300));
+        const list = [...document.querySelectorAll('#loom_panel details.loom_section')];
+        return list.map(section => ({
+            id: section.dataset.section,
+            open: section.open,
+            hasSummary: Boolean(section.querySelector('summary')),
+        }));`);
+    const byId = new Map((sections ?? []).map(section => [section.id, section]));
+    assertThat('the panel is split into collapsible sections',
+        byId.size >= 7 && [...byId.values()].every(section => section.hasSummary === true),
+        JSON.stringify(sections));
+    assertThat('installing and scripting stay open, long registries start collapsed',
+        byId.get('installer')?.open === true && byId.get('scripts')?.open === true
+        && byId.get('capabilities')?.open === false && byId.get('events')?.open === false,
+        JSON.stringify(sections));
+
+    const toggled = await cdp.evaluate(`const section = [...document.querySelectorAll('#loom_panel details.loom_section')]
+            .find(item => item.dataset.section === 'permissions');
+        section.querySelector('summary').click();
+        await new Promise(resolve => setTimeout(resolve, 200));
+        const stored = window.Loom.getState('loom-ui', 'panelSections') ?? {};
+        const opened = section.open;
+        section.querySelector('summary').click();
+        await new Promise(resolve => setTimeout(resolve, 200));
+        return { opened, stored, closed: section.open, storedAfter: window.Loom.getState('loom-ui', 'panelSections') ?? {} };`);
+    assertThat('a section toggle is persisted',
+        toggled.opened === true && toggled.stored.permissions === true
+        && toggled.closed === false && toggled.storedAfter.permissions === false,
+        JSON.stringify(toggled));
+
+    const rescanned = await cdp.evaluate(`return { ids: await window.LoomUI.rescanExtensions(), problems: window.LoomUI.getInstallProblems() };`);
+    assertThat('rescan re-reads the index without a reload',
+        Array.isArray(rescanned.ids) && rescanned.ids.includes('hello-loom')
+        && rescanned.ids.includes('world-book-manager') && rescanned.problems.length === 0,
+        JSON.stringify(rescanned));
+
+    // Script editing through the real buttons: load, change, save, observe new behaviour.
+    const EDITED_SOURCE = SCRIPT_SOURCE.replace(
+        "execute: input => input.value.toUpperCase(),",
+        "execute: input => input.value.toLowerCase() + '?',",
+    );
+    const edited = await cdp.evaluate(`for (const script of (window.LoomUI.listScripts() ?? [])) {
+            if (script.id.startsWith('script-verify')) await window.LoomUI.deleteScript(script.id);
+        }
+        const id = await window.LoomUI.saveScript('verify edit', ${JSON.stringify(SCRIPT_SOURCE)});
+        const loadRow = () => [...document.querySelectorAll('#loom_scripts_list .loom_install_row')]
+            .find(row => row.textContent.includes(id));
+        const button = label => [...(loadRow()?.querySelectorAll('button') ?? [])].find(item => item.textContent === label);
+        button('编辑')?.click();
+        await new Promise(resolve => setTimeout(resolve, 200));
+        const sourceField = document.querySelector('#loom_scripts_source');
+        const filled = sourceField?.value ?? '';
+        sourceField.value = ${JSON.stringify(EDITED_SOURCE)};
+        const saveButton = document.querySelector('#loom_scripts_save');
+        const saveLabel = saveButton?.textContent ?? '';
+        saveButton?.click();
+        await new Promise(resolve => setTimeout(resolve, 600));
+        const call = await window.Loom.executeCapability(id, 'verify.echo', { value: 'MiXeD' });
+        return {
+            id, filledMatches: filled.includes('toUpperCase'),
+            saveLabel, call,
+            count: (window.LoomUI.listScripts() ?? []).filter(script => script.id.startsWith('script-verify')).length,
+        };`);
+    assertThat('editing a script loads its source into the form',
+        edited.filledMatches === true && edited.saveLabel === '保存修改', JSON.stringify(edited));
+    assertThat('saving the edit replaces the running script',
+        edited.call.success === true && edited.call.data === 'mixed?' && edited.count === 1,
+        JSON.stringify(edited));
+    await cdp.evaluate(`for (const script of (window.LoomUI.listScripts() ?? [])) {
+        if (script.id.startsWith('script-verify')) await window.LoomUI.deleteScript(script.id);
+    }`);
+}
+
 async function probeWorldRename(cdp) {
     await cdp.evaluate(`const Loom = window.Loom;
         if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) Loom.loadExtension({ id: 'verify-probe', name: 'Verify Probe' });
@@ -1985,8 +2060,26 @@ async function probeMobileLayout(cdp) {
                 && getComputedStyle(consent).display !== 'none'
                 && consent.getBoundingClientRect().height > 0);
             if (consentWasVisible) consent.style.visibility = 'hidden';
+            // SillyTavern may leave its own modal/loader above everything (a probe
+            // can trigger one). Hide unrelated overlays for the hit-test and record
+            // what was blocking, so a real panel failure stays distinguishable.
+            const overlays = [...document.querySelectorAll('body > .popup, body > .loader, body > #dialogs')]
+                .filter(element => element && getComputedStyle(element).display !== 'none'
+                    && element.getBoundingClientRect().height > 0);
+            const overlayNames = overlays.map(element => element.id || element.className);
+            const overlayStyles = overlays.map(element => [element, element.style.visibility]);
+            for (const element of overlays) element.style.visibility = 'hidden';
             const center = document.elementFromPoint(Math.round(window.innerWidth / 2), Math.round(window.innerHeight / 2));
+            const fallback = document.elementFromPoint(
+                Math.round((panelRect?.left ?? 0) + 8),
+                Math.round((panelRect?.top ?? 0) + 120),
+            );
+            for (const [element, visibility] of overlayStyles) element.style.visibility = visibility;
             if (consentWasVisible) consent.style.visibility = '';
+            const insidePanel = Boolean(center && panel && panel.contains(center))
+                || Boolean(fallback && panel && panel.contains(fallback));
+            const topAtCenter = center ? (center.id || center.className || center.tagName) : null;
+            const topAtFallback = fallback ? (fallback.id || fallback.className || fallback.tagName) : null;
             document.getElementById('loom_wbm_button')?.click();
             await new Promise(resolve => setTimeout(resolve, 500));
             const manager = document.getElementById('loom_wbm_panel');
@@ -2005,7 +2098,10 @@ async function probeMobileLayout(cdp) {
                 panelWidth: Math.round(panelRect?.width ?? 0),
                 panelHeight: Math.round(panelRect?.height ?? 0),
                 panelTop: Math.round(panelRect?.top ?? -1),
-                panelInteractive: Boolean(center && panel && panel.contains(center)),
+                panelInteractive: insidePanel,
+                topAtCenter,
+                topAtFallback,
+                blockedBy: overlayNames,
                 managerWidth: Math.round(managerRect?.width ?? 0),
                 managerTop: Math.round(managerRect?.top ?? -1),
                 managerBottom: Math.round(managerRect?.bottom ?? -1),
@@ -2023,8 +2119,7 @@ async function probeMobileLayout(cdp) {
         assertThat('the Loom panel fills the phone viewport and is hit-testable',
             mobile.panelHeight >= Math.round(mobile.innerHeight * 0.8) && mobile.panelTop === 0
             && mobile.panelInteractive === true,
-            JSON.stringify(mobile));
-        assertThat('the manager panel and launcher fit the phone viewport',
+            JSON.stringify(mobile));        assertThat('the manager panel and launcher fit the phone viewport',
             mobile.managerWidth > 0 && mobile.managerWidth <= 390 && mobile.managerLeft >= 0
             && mobile.managerTop >= 0 && mobile.managerBottom <= mobile.innerHeight
             && mobile.managerButtonTop >= 0 && mobile.managerButtonBottom <= mobile.innerHeight,
@@ -2159,6 +2254,7 @@ async function main() {
         await runProbe('entries', probeEntries, cdp);
         await runProbe('panel', probePanel, cdp);
         await runProbe('button layout', probeButtonLayout, cdp);
+        await runProbe('panel sections', probePanelSections, cdp);
         await runProbe('live reads', probeLiveReads, cdp);
         await runProbe('permission flow', probePermissionFlow, cdp);
         await runProbe('consent prompt', probeConsent, cdp);

@@ -76,11 +76,15 @@ const INSTALL_STATE_KEY = 'installedExtensions';
 const DISABLED_STATE_KEY = 'disabledExtensions';
 const SCRIPTS_STATE_KEY = 'scripts';
 const LOOM_ROOT = new URL('../', import.meta.url);
+const SECTION_STATE_KEY = 'panelSections';
+const SECTION_DEFAULTS = Object.freeze({ installer: true, scripts: true });
 const bundledSources = [];
 const installProblems = [];
 let installedEntries = [];
 let disabledIds = [];
 let scripts = [];
+let sectionState = {};
+let editingScriptId = null;
 
 function ensureExtension() {
     if (!runtime?.registerExtension || runtime.listExtensions().some(extension => extension.id === EXTENSION_ID)) {
@@ -154,6 +158,35 @@ function findSource(identity) {
 
 function isDisabled(identity) {
     return disabledIds.includes(identity);
+}
+
+/** Section open/closed state is part of the panel's persisted UI state. */
+function readSectionState() {
+    const stored = runtime?.getState?.(EXTENSION_ID, SECTION_STATE_KEY);
+    return stored && typeof stored === 'object' && !Array.isArray(stored) ? { ...stored } : {};
+}
+
+function persistSectionState() {
+    runtime?.setState?.(EXTENSION_ID, SECTION_STATE_KEY, { ...sectionState });
+}
+
+/**
+ * Apply the persisted open/closed state to every section and bind its toggle once.
+ * Mounted sections (installer, scripts) create their own `<details>` elements, so
+ * this runs again after they mount.
+ */
+function applySectionState() {
+    sectionState = readSectionState();
+    for (const details of document.querySelectorAll(`#${PANEL_ID} details.loom_section`)) {
+        const id = details.dataset.section;
+        details.open = sectionState[id] ?? (SECTION_DEFAULTS[id] === true);
+        if (details.dataset.bound === '1') continue;
+        details.dataset.bound = '1';
+        details.addEventListener('toggle', () => {
+            sectionState[id] = details.open;
+            persistSectionState();
+        });
+    }
 }
 
 async function loadBundledIndex() {
@@ -266,6 +299,34 @@ async function reloadExtension(identity) {
     renderInstaller();
     renderExtensionStates();
     return entry;
+}
+
+/**
+ * Re-read `extensions/index.json` and import anything new or not yet active.
+ *
+ * This is the "I dropped a package in the folder" button: no page reload, no
+ * reinstalling, and disabled packages stay skipped.
+ */
+async function rescanExtensions() {
+    installProblems.length = 0;
+    installedEntries = readInstalledEntries();
+    disabledIds = readDisabledIds();
+    scripts = readScripts();
+
+    const index = await loadBundledIndex();
+    bundledSources.length = 0;
+    bundledSources.push(...index.sources);
+    installProblems.push(...index.problems);
+
+    for (const source of allSources()) {
+        if (source.id && isDisabled(source.id)) continue;
+        if (source.id && runtime?.getExtensionState?.(source.id)?.state === 'active') continue;
+        await importSource(source);
+    }
+    renderInstaller();
+    renderScripts();
+    renderExtensionStates();
+    return allSources().map(source => source.id).filter(Boolean);
 }
 
 async function installExtension(url) {
@@ -430,6 +491,7 @@ function renderScripts() {
                         ${error ? `<span class="loom_install_error">${escapeHtml(error)}</span>` : ''}
                     </div>
                     <button type="button" class="menu_button" data-script-toggle="${escapeHtml(script.id)}" data-enabled="${script.enabled !== false}">${script.enabled === false ? '启用' : '停用'}</button>
+                    <button type="button" class="menu_button" data-script-edit="${escapeHtml(script.id)}">编辑</button>
                     <button type="button" class="menu_button" data-script-run="${escapeHtml(script.id)}">重新运行</button>
                     <button type="button" class="menu_button" data-script-delete="${escapeHtml(script.id)}">删除</button>
                 </div>`;
@@ -483,12 +545,29 @@ function renderInstaller() {
     }
 }
 
+/**
+ * Turn a mounted section into a collapsible one without rewriting its markup:
+ * the existing children move into a body and the heading becomes the summary.
+ */
+function wrapMountedSection(details, title) {
+    const body = document.createElement('div');
+    body.className = 'loom_section_body';
+    while (details.firstChild) body.append(details.firstChild);
+    const heading = body.querySelector('h3');
+    if (heading) heading.remove();
+    const summary = document.createElement('summary');
+    summary.textContent = title;
+    details.append(summary, body);
+}
+
 function mountInstallerSection() {
     if (document.getElementById(INSTALLER_SECTION_ID)) return;
     const content = document.querySelector(`#${PANEL_ID} .loom_panel_content`);
     if (!content) return;
 
-    const section = document.createElement('section');
+    const section = document.createElement('details');
+    section.className = 'loom_section';
+    section.dataset.section = 'installer';
     section.id = INSTALLER_SECTION_ID;
     section.innerHTML = `
         <h3>扩展安装</h3>
@@ -500,7 +579,27 @@ function mountInstallerSection() {
         <div id="${INSTALLER_SECTION_ID}_list"></div>
         <div id="${INSTALLER_SECTION_ID}_problems"></div>
     `;
+    wrapMountedSection(section, '安装与扩展');
     content.append(section);
+
+    const rescanButton = document.createElement('button');
+    rescanButton.type = 'button';
+    rescanButton.className = 'menu_button';
+    rescanButton.textContent = '重新扫描';
+    rescanButton.title = '重新读取 extensions/index.json 并导入新增的扩展';
+    rescanButton.addEventListener('click', async event => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+            await rescanExtensions();
+        } catch (error) {
+            installProblems.push(error instanceof Error ? error.message : String(error));
+            renderInstaller();
+        } finally {
+            button.disabled = false;
+        }
+    });
+    section.querySelector('.loom_installer_controls')?.append(rescanButton);
 
     section.querySelector(`#${INSTALLER_SECTION_ID}_button`)?.addEventListener('click', async event => {
         const input = section.querySelector(`#${INSTALLER_SECTION_ID}_url`);
@@ -545,7 +644,9 @@ function mountScriptSection() {
     const content = document.querySelector(`#${PANEL_ID} .loom_panel_content`);
     if (!content) return;
 
-    const section = document.createElement('section');
+    const section = document.createElement('details');
+    section.className = 'loom_section';
+    section.dataset.section = 'scripts';
     section.id = SCRIPT_SECTION_ID;
     section.innerHTML = `
         <h3>脚本</h3>
@@ -560,6 +661,7 @@ function mountScriptSection() {
         </div>
         <div id="${SCRIPT_SECTION_ID}_list"></div>
     `;
+    wrapMountedSection(section, '脚本');
     content.append(section);
 
     section.querySelector(`#${SCRIPT_SECTION_ID}_save`)?.addEventListener('click', async event => {
@@ -569,8 +671,17 @@ function mountScriptSection() {
         const status = section.querySelector(`#${SCRIPT_SECTION_ID}_status`);
         button.disabled = true;
         try {
-            await saveScript(name, source);
-            if (status) status.textContent = '已保存并运行。';
+            if (editingScriptId) {
+                await updateScript(editingScriptId, source);
+                if (status) status.textContent = '已保存修改并重新运行。';
+                editingScriptId = null;
+                button.textContent = '保存并运行';
+                const nameField = section.querySelector(`#${SCRIPT_SECTION_ID}_name`);
+                if (nameField) nameField.value = '';
+            } else {
+                await saveScript(name, source);
+                if (status) status.textContent = '已保存并运行。';
+            }
             const sourceField = section.querySelector(`#${SCRIPT_SECTION_ID}_source`);
             if (sourceField) sourceField.value = '';
         } catch (error) {
@@ -583,6 +694,7 @@ function mountScriptSection() {
     section.addEventListener('click', async event => {
         const run = event.target.closest('[data-script-run]');
         const toggle = event.target.closest('[data-script-toggle]');
+        const edit = event.target.closest('[data-script-edit]');
         const remove = event.target.closest('[data-script-delete]');
         try {
             if (run) {
@@ -598,8 +710,26 @@ function mountScriptSection() {
             } else if (toggle) {
                 toggle.disabled = true;
                 await setScriptEnabled(toggle.dataset.scriptToggle, toggle.dataset.enabled !== 'true');
+            } else if (edit) {
+                const record = scripts.find(script => script.id === edit.dataset.scriptEdit);
+                if (record) {
+                    editingScriptId = record.id;
+                    const nameField = section.querySelector(`#${SCRIPT_SECTION_ID}_name`);
+                    const sourceField = section.querySelector(`#${SCRIPT_SECTION_ID}_source`);
+                    const saveButton = section.querySelector(`#${SCRIPT_SECTION_ID}_save`);
+                    const status = section.querySelector(`#${SCRIPT_SECTION_ID}_status`);
+                    if (nameField) nameField.value = record.name;
+                    if (sourceField) sourceField.value = record.source;
+                    if (saveButton) saveButton.textContent = '保存修改';
+                    if (status) status.textContent = `正在编辑 ${record.id}`;
+                }
             } else if (remove) {
                 remove.disabled = true;
+                if (remove.dataset.scriptDelete === editingScriptId) {
+                    editingScriptId = null;
+                    const saveButton = section.querySelector(`#${SCRIPT_SECTION_ID}_save`);
+                    if (saveButton) saveButton.textContent = '保存并运行';
+                }
                 await deleteScript(remove.dataset.scriptDelete);
             }
         } catch (error) {
@@ -650,6 +780,7 @@ function installUiApi() {
         listScripts: () => scripts.map(script => ({ id: script.id, name: script.name, length: script.source.length })),
         getInstallProblems: () => [...installProblems],
         isReady: () => installerReady,
+        rescanExtensions: () => rescanExtensions(),
     });
     globalThis.LoomUI = ui;
     runtime.registerCapability(EXTENSION_ID, {
@@ -1064,25 +1195,38 @@ function installPanel() {
                 <div class="loom_status"><span>已授权权限</span><strong id="loom_permission_count">0</strong></div>
                 <div class="loom_status"><span>身份冲突</span><strong id="loom_identity_conflict_count">0</strong></div>
                 <div id="loom_identity_conflicts"></div>
-                <h3>扩展</h3>
-                <div id="loom_extensions"></div>
-                <h3>宿主环境</h3>
-                <p class="loom_host" id="loom_host_status">未连接</p>
-                <div class="loom_status"><span>当前角色</span><strong id="loom_host_character">—</strong></div>
-                <div class="loom_status"><span>当前聊天</span><strong id="loom_host_chat">—</strong></div>
-                <div class="loom_status"><span>消息数量</span><strong id="loom_host_messages">—</strong></div>
-                <h3>权限</h3>
-                <div id="${PERMISSION_SECTION_ID}"></div>
-                <h3>事件监听</h3>
-                <div id="loom_events"></div>
-                <h3>公开能力</h3>
-                <div id="loom_capabilities"></div>
+                <details class="loom_section" data-section="extensions">
+                    <summary>扩展状态</summary>
+                    <div class="loom_section_body"><div id="loom_extensions"></div></div>
+                </details>
+                <details class="loom_section" data-section="host">
+                    <summary>宿主环境</summary>
+                    <div class="loom_section_body">
+                        <p class="loom_host" id="loom_host_status">未连接</p>
+                        <div class="loom_status"><span>当前角色</span><strong id="loom_host_character">—</strong></div>
+                        <div class="loom_status"><span>当前聊天</span><strong id="loom_host_chat">—</strong></div>
+                        <div class="loom_status"><span>消息数量</span><strong id="loom_host_messages">—</strong></div>
+                    </div>
+                </details>
+                <details class="loom_section" data-section="permissions">
+                    <summary>权限</summary>
+                    <div class="loom_section_body"><div id="${PERMISSION_SECTION_ID}"></div></div>
+                </details>
+                <details class="loom_section" data-section="events">
+                    <summary>事件监听</summary>
+                    <div class="loom_section_body"><div id="loom_events"></div></div>
+                </details>
+                <details class="loom_section" data-section="capabilities">
+                    <summary>公开能力</summary>
+                    <div class="loom_section_body"><div id="loom_capabilities"></div></div>
+                </details>
             </div>
         </div>
     `;
     document.body.append(panel);
     mountInstallerSection();
     mountScriptSection();
+    applySectionState();
     document.getElementById('loom_close').addEventListener('click', closePanel);
     document.getElementById('loom_refresh').addEventListener('click', renderPanel);
     // Delegated: the permission list is re-rendered on every toggle, so bind to
