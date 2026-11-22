@@ -118,6 +118,7 @@ test('registers the host adapter and its capabilities', () => {
             'chat.messages',
             'context.snapshot',
             'prompt.clear',
+            'prompt.filterStats',
             'prompt.list',
             'prompt.set',
             'settings.get',

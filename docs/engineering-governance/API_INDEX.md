@@ -253,6 +253,22 @@ Writing into the generation context is the most invasive family, so it has its *
 - `prompt.clear` takes one `key` or `all: true`; clearing a missing key returns an empty `cleared` list rather than failing.
 - **Not supported:** mutating generation itself (`GENERATION_AFTER_COMMANDS`). Its options object is undocumented host internals; wrapping it would be a fragile contract. Observation remains available through `host:generation:started` / `host:generation:ended`.
 
+## Prompt visibility (blocks)
+
+An extension can put a **display-only region** in message text so a UI can be drawn there while the model never reads it:
+
+```
+⟦loom:widget⟧{"slot":"hud"}⟦/loom⟧   paired block, payload inside
+⟦loom:hud⟧                          pointer, payload lives in Loom state
+```
+
+- Grammar lives in `Loom Core/markers.js` (`formatBlock`, `parseBlocks`, `hasBlocks`, `stripBlocks`, `stripBlocksFromMessage`); block ids must match `^[a-z0-9][a-z0-9._-]*$`.
+- The host adapter strips blocks from **both** prompt families by listening to SillyTavern's public mutation hooks: `CHAT_COMPLETION_PROMPT_READY` (`{ chat: [...] }`) and `GENERATE_AFTER_COMBINE_PROMPTS` (`{ prompt }`). A stored message keeps its block (so a future renderer can draw it); the model receives the text with the block removed.
+- `stripBlocks(text, { replacement })` can keep a compact summary instead of removing the block entirely — the extension decides what the model should still see.
+- `prompt.filterStats` (read, ungated) → `{ scanned, stripped }`, for diagnostics without exposing prompt content.
+- **Scope:** Loom only removes its own block syntax. Hiding arbitrary user text stays with SillyTavern's regex extension (the rule is user-written and user-visible), which is why Loom does not ship a second regex engine.
+- Nothing renders blocks yet; rendering is the widget extension's job.
+
 ## Built-in Host Events (`loom-host`)
 
 The adapter forwards an allowlist of SillyTavern events as Loom events, with payload `{ source: 'sillytavern', event: <HOST_EVENT_KEY> }`. Raw host arguments are intentionally not forwarded.
