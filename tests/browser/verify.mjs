@@ -1991,6 +1991,73 @@ async function probePromptFilter(cdp) {
         JSON.stringify(roundTrip));
 }
 
+async function probeBlockRendering(cdp) {
+    // Renders into a detached fixture, never into the user's chat: the renderer is
+    // given a root element, so a synthetic `.mes` proves the whole path without
+    // touching real messages.
+    const rendered = await cdp.evaluate(`const Loom = window.Loom;
+        if (Loom.listExtensions().some(entry => entry.id === 'verify-blocks')) Loom.unregisterExtension('verify-blocks');
+        Loom.registerExtension({ id: 'verify-blocks', name: 'Block Probe' });
+        window.LoomUI.registerBlock('verify-blocks', {
+            id: 'probe.hud',
+            name: 'Probe HUD',
+            build: ({ inner }) => ({ component: 'text', props: { text: 'HUD ' + inner } }),
+        });
+        const host = document.createElement('div');
+        host.id = 'loom_block_probe';
+        host.innerHTML = '<div class="mes" mesid="42"><div class="mes_text">prefix \\u27E6loom:probe.hud\\u27E7hp=7\\u27E6/loom\\u27E7 suffix</div></div>'
+            + '<div class="mes" mesid="43"><div class="mes_text">plain message</div></div>';
+        document.body.append(host);
+        const count = window.LoomUI.refreshBlocks(host);
+        const widget = host.querySelector('.loom-block[data-loom-block="probe.hud"]');
+        return {
+            count,
+            markerGone: !host.textContent.includes('\\u27E6loom:'),
+            widgetText: widget?.textContent ?? null,
+            mounted: (window.LoomUI.listBlockMounts?.() ?? []).length,
+            listBlocks: window.LoomUI.listBlocks('verify-blocks').map(entry => entry.id),
+            plainUntouched: host.querySelector('.mes[mesid="43"] .mes_text').textContent === 'plain message',
+        };`);
+    assertThat('a registered block renders as a live view inside the message',
+        rendered.count === 1 && rendered.markerGone === true && rendered.widgetText === 'HUD hp=7'
+        && rendered.listBlocks?.[0] === 'probe.hud' && rendered.plainUntouched === true,
+        JSON.stringify(rendered));
+
+    const rebuilt = await cdp.evaluate(`const host = document.getElementById('loom_block_probe');
+        const body = host.querySelector('.mes[mesid="42"] .mes_text');
+        // SillyTavern rebuilding the body from stored text must not double the widget.
+        body.textContent = 'prefix \\u27E6loom:probe.hud\\u27E7hp=8\\u27E6/loom\\u27E7 suffix';
+        window.LoomUI.refreshBlocks(host);
+        return {
+            widgets: host.querySelectorAll('.mes[mesid="42"] .loom-block').length,
+            text: host.querySelector('.mes[mesid="42"] .loom-block').textContent,
+        };`);
+    assertThat('re-rendering a message keeps exactly one widget',
+        rebuilt.widgets === 1 && rebuilt.text === 'HUD hp=8', JSON.stringify(rebuilt));
+
+    const unknown = await cdp.evaluate(`const host = document.getElementById('loom_block_probe');
+        const body = host.querySelector('.mes[mesid="42"] .mes_text');
+        body.textContent = 'x \\u27E6loom:no.renderer\\u27E7 y';
+        window.LoomUI.refreshBlocks(host);
+        const placeholder = body.querySelector('.loom-block');
+        return {
+            markerGone: !body.textContent.includes('\\u27E6loom:'),
+            hidden: placeholder?.hidden ?? null,
+        };`);
+    assertThat('an unknown kind is hidden rather than shown as raw syntax',
+        unknown.markerGone === true && unknown.hidden === true, JSON.stringify(unknown));
+
+    const cleaned = await cdp.evaluate(`window.Loom.unregisterExtension('verify-blocks');
+        const host = document.getElementById('loom_block_probe');
+        // Count rendered widgets only: the last step left a hidden placeholder for an
+        // unknown kind, which is not owned by the extension.
+        const widgets = host.querySelectorAll('.loom-block:not([hidden])').length;
+        host.remove();
+        return { widgets, blocks: window.LoomUI.listBlocks('verify-blocks').length };`);
+    assertThat('unregistering the block owner removes its widgets',
+        cleaned.widgets === 0 && cleaned.blocks === 0, JSON.stringify(cleaned));
+}
+
 async function probeWorldRename(cdp) {
     await cdp.evaluate(`const Loom = window.Loom;
         if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) Loom.loadExtension({ id: 'verify-probe', name: 'Verify Probe' });
@@ -2553,6 +2620,7 @@ async function main() {
         await runProbe('identity and metadata', probeIdentityAndMetadata, cdp);
         await runProbe('prompt injection', probePromptInjection, cdp);
         await runProbe('prompt filter', probePromptFilter, cdp);
+        await runProbe('block rendering', probeBlockRendering, cdp);
         await runProbe('native slot', probeNativeSlot, cdp);
         await runProbe('external extensions', probeExternalExtensions, cdp);
         await runProbe('live reads', probeLiveReads, cdp);

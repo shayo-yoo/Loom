@@ -52,6 +52,23 @@
     border-top: 0;
 }
 
+/* A display block rendered inside a message. Widgets own their inner layout; this
+   only makes the container behave in the message flow and keeps it clickable
+   without letting a click fall through to the message editor behind it. */
+.loom-block {
+    display: block;
+    margin: 6px 0;
+    min-width: 0;
+}
+
+.loom-block[hidden] {
+    display: none;
+}
+
+.loom-block > * {
+    pointer-events: auto;
+}
+
 /* A view mounted into a native SillyTavern panel slot. */
 .loom-slot {
     display: block;

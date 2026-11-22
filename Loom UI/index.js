@@ -20,6 +20,12 @@ import {
 } from './views.js';
 import { serializeNode } from './view-tree.js';
 import { registerCompositeComponent } from './composite.js';
+import {
+    disposeMessageBlocks,
+    listBlocks,
+    refreshBlocks,
+    registerBlock,
+} from './blocks.js';
 import { SLOTS, listSlotMounts, mountToSlot, unmountFromSlot } from './slots.js';
 import {
     describeExternal,
@@ -837,6 +843,14 @@ function installUiApi() {
                 : registerCompositeComponent(EXTENSION_ID, extensionIdOrDefinition)
         ),
         slots: Object.freeze({ ...SLOTS }),
+        registerBlock: (extensionIdOrDefinition, maybeDefinition) => (
+            typeof extensionIdOrDefinition === 'string'
+                ? registerBlock(extensionIdOrDefinition, maybeDefinition)
+                : registerBlock(EXTENSION_ID, extensionIdOrDefinition)
+        ),
+        listBlocks: (extensionId) => listBlocks(extensionId),
+        refreshBlocks: (root) => refreshBlocks(root),
+        disposeMessageBlocks: (messageId) => disposeMessageBlocks(messageId),
         mountToSlot: (extensionIdOrSlot, slotOrOptions, maybeOptions) => (
             typeof extensionIdOrSlot === 'string' && Object.hasOwn(SLOTS, extensionIdOrSlot)
                 ? mountToSlot(EXTENSION_ID, extensionIdOrSlot, slotOrOptions)
@@ -1495,6 +1509,20 @@ function wireEvents() {
     };
     for (const eventName of HOST_EVENTS) {
         runtime.subscribe(EXTENSION_ID, eventName, refresh);
+    }
+    // Display blocks are drawn from message text, so a new or changed message needs
+    // a re-render. Both events are already bridged; refreshing is proportional to the
+    // messages that actually contain a block.
+    for (const eventName of ['host:message:received', 'host:chat:changed']) {
+        runtime.subscribe(EXTENSION_ID, eventName, () => {
+            setTimeout(() => {
+                try {
+                    refreshBlocks();
+                } catch (error) {
+                    console.error('[Loom] Block refresh failed:', error);
+                }
+            }, 0);
+        });
     }
     // Consent prompts are driven by Core, not by polling.
     runtime.subscribe(EXTENSION_ID, 'core:permission:requested', () => renderConsent());
