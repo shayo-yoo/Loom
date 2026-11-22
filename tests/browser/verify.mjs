@@ -1823,6 +1823,46 @@ async function probeExtensionManagement(cdp) {
         };`);
     assertThat('reloading re-registers the extension', reloaded.state === 'active' && reloaded.calls === 1,
         JSON.stringify(reloaded));
+
+    // The real click path: the row's 停用 button must disable, and its 启用 button
+    // must enable — an inverted attribute once made 停用 re-import the package and
+    // report "Extension is already loaded".
+    const problemsBefore = await cdp.evaluate('return window.LoomUI.getInstallProblems().length;');
+    const clickedDisable = await cdp.evaluate(`const row = () => [...document.querySelectorAll('#loom_installer_list .loom_install_row')]
+            .find(element => element.textContent.includes('Hello Loom'));
+        const button = label => [...(row()?.querySelectorAll('button') ?? [])].find(element => element.textContent === label);
+        button('停用')?.click();
+        await new Promise(resolve => setTimeout(resolve, 500));
+        return {
+            registered: window.Loom.listExtensions().some(entry => entry.id === 'hello-loom'),
+            disabled: (window.Loom.getState('loom-ui', 'disabledExtensions') ?? []).includes('hello-loom'),
+            nextLabel: Boolean(button('启用')),
+            statusText: row()?.textContent.includes('已停用') ?? false,
+            // The row keeps its display name from the package, not the id.
+            nameKept: row()?.textContent.includes('Hello Loom') ?? false,
+            newProblems: window.LoomUI.getInstallProblems().slice(${problemsBefore}),
+        };`);
+    assertThat('clicking 停用 disables the row without an import error',
+        clickedDisable.registered === false && clickedDisable.disabled === true
+        && clickedDisable.nextLabel === true && clickedDisable.statusText === true
+        && clickedDisable.nameKept === true
+        && !clickedDisable.newProblems.some(problem => /already loaded/.test(problem)),
+        JSON.stringify(clickedDisable));
+
+    const clickedEnable = await cdp.evaluate(`const row = () => [...document.querySelectorAll('#loom_installer_list .loom_install_row')]
+            .find(element => element.textContent.includes('Hello Loom'));
+        const button = label => [...(row()?.querySelectorAll('button') ?? [])].find(element => element.textContent === label);
+        button('启用')?.click();
+        await new Promise(resolve => setTimeout(resolve, 800));
+        return {
+            state: window.Loom.getExtensionState('hello-loom')?.state ?? null,
+            disabled: (window.Loom.getState('loom-ui', 'disabledExtensions') ?? []).includes('hello-loom'),
+            newProblems: window.LoomUI.getInstallProblems().slice(${problemsBefore}),
+        };`);
+    assertThat('clicking 启用 restores the row without an import error',
+        clickedEnable.state === 'active' && clickedEnable.disabled === false
+        && !clickedEnable.newProblems.some(problem => /already loaded/.test(problem)),
+        JSON.stringify(clickedEnable));
 }
 
 const SCRIPT_SOURCE = `export default {
@@ -1937,9 +1977,16 @@ async function probeMobileLayout(cdp) {
             const rect = element => element ? element.getBoundingClientRect() : null;
             const panelRect = rect(panel);
             const toggleRect = rect(toggle);
-            // The panel must be hit-testable: a zero-height fixed container (SillyTavern
-            // sets a transformed root on phones) would leave this null or outside.
+            // The consent prompt is a separate overlay and may sit above the panel
+            // (pending requests are common during a full run). Hide it for the
+            // hit-test only — the question is whether the panel itself is visible.
+            const consent = document.getElementById('loom_consent');
+            const consentWasVisible = Boolean(consent && !consent.hidden
+                && getComputedStyle(consent).display !== 'none'
+                && consent.getBoundingClientRect().height > 0);
+            if (consentWasVisible) consent.style.visibility = 'hidden';
             const center = document.elementFromPoint(Math.round(window.innerWidth / 2), Math.round(window.innerHeight / 2));
+            if (consentWasVisible) consent.style.visibility = '';
             document.getElementById('loom_wbm_button')?.click();
             await new Promise(resolve => setTimeout(resolve, 500));
             const manager = document.getElementById('loom_wbm_panel');

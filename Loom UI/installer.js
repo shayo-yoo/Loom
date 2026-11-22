@@ -91,7 +91,14 @@ export function normalizeUserSource(id, url, baseUrl) {
 export function rememberInstalled(installed, source) {
     const list = Array.isArray(installed) ? installed.filter(entry => entry && typeof entry.entry === 'string') : [];
     const rest = list.filter(entry => entry.entry !== source.entry);
-    return [...rest, { id: source.id ?? null, entry: source.entry, bundled: Boolean(source.bundled) }];
+    return [...rest, {
+        id: source.id ?? null,
+        // Keep the display metadata: the runtime state is gone while disabled.
+        name: source.name ?? null,
+        version: source.version ?? '',
+        entry: source.entry,
+        bundled: Boolean(source.bundled),
+    }];
 }
 
 /** Remove an installed entry by runtime id or entry URL. */
@@ -110,7 +117,9 @@ export function describeInstalled(installed, states) {
             entry: entry.entry,
             bundled: Boolean(entry.bundled),
             state: state?.state ?? (entry.id ? 'missing' : 'unknown'),
-            name: state?.name ?? entry.id ?? entry.entry,
+            // Prefer the package's declared name: after disabling, the runtime state
+            // is gone and falling back to the id would rename the row.
+            name: entry.name ?? state?.name ?? entry.id ?? entry.entry,
             version: entry.version ?? state?.version ?? '',
             permissions: Array.isArray(entry.permissions) ? entry.permissions : [],
             dependencies: Array.isArray(entry.dependencies) ? entry.dependencies : [],

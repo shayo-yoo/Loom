@@ -228,13 +228,18 @@ async function bootExtensions() {
 async function setExtensionEnabled(identity, enabled) {
     const source = findSource(identity);
     if (!source) throw new Error(`未找到扩展：${identity}`);
+    const state = source.id ? runtime?.getExtensionState?.(source.id) : null;
 
     if (!enabled) {
-        if (source.id) runtime?.unloadExtension?.(source.id);
+        // Idempotent: disabling something that is already unloaded only records
+        // the choice, so a double click cannot reach the host.
+        if (state) runtime?.unloadExtension?.(source.id);
         persistDisabledIds([...disabledIds, source.id ?? identity]);
     } else {
         persistDisabledIds(disabledIds.filter(id => id !== (source.id ?? identity)));
-        await importSource(source);
+        // Re-importing an extension that is already registered would fail with
+        // "already loaded"; enabling is a no-op in that case.
+        if (state?.state !== 'active') await importSource(source);
     }
     renderInstaller();
     renderExtensionStates();
@@ -278,6 +283,8 @@ async function installExtension(url) {
     }
     persistInstalledEntries(rememberInstalled(installedEntries, {
         id: result?.id ?? source.id ?? null,
+        name: result?.name ?? source.name ?? null,
+        version: result?.version ?? '',
         entry: source.entry,
         bundled: false,
     }));
@@ -450,7 +457,7 @@ function renderInstaller() {
                 row.dependencies.length ? `依赖：${row.dependencies.join('、')}` : '',
             ].filter(Boolean).join(' · ');
             const toggle = row.id
-                ? `<button type="button" class="menu_button" data-loom-toggle="${escapeHtml(row.id)}" data-enabled="${disabled}">${disabled ? '启用' : '停用'}</button>`
+                ? `<button type="button" class="menu_button" data-loom-toggle="${escapeHtml(row.id)}" data-enabled="${!disabled}">${disabled ? '启用' : '停用'}</button>`
                 : '';
             const reload = row.id
                 ? `<button type="button" class="menu_button" data-loom-reload="${escapeHtml(row.id)}">重新加载</button>`

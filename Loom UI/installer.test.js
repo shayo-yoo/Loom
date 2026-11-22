@@ -57,16 +57,24 @@ test('normalises a user-installed module URL', () => {
 });
 
 test('remembers an install without duplicating the same entry', () => {
-    const source = { id: 'hello-loom', entry: `${BASE}extensions/hello-loom/index.js`, bundled: true };
+    const source = {
+        id: 'hello-loom', name: 'Hello Loom', version: '0.1.0',
+        entry: `${BASE}extensions/hello-loom/index.js`, bundled: true,
+    };
+    const expected = [{
+        id: 'hello-loom', name: 'Hello Loom', version: '0.1.0',
+        entry: source.entry, bundled: true,
+    }];
     const first = rememberInstalled([], source);
-    assert.deepEqual(first, [{ id: 'hello-loom', entry: source.entry, bundled: true }]);
+    assert.deepEqual(first, expected);
 
-    const renamed = { ...source, id: 'hello-loom-v2' };
+    const renamed = { ...source, id: 'hello-loom-v2', name: 'Hello Loom 2' };
     const second = rememberInstalled(first, renamed);
     assert.equal(second.length, 1, 'the same entry replaces the previous record');
     assert.equal(second[0].id, 'hello-loom-v2');
+    assert.equal(second[0].name, 'Hello Loom 2', 'display metadata is kept for the disabled state');
 
-    assert.deepEqual(rememberInstalled(null, source), [{ id: 'hello-loom', entry: source.entry, bundled: true }]);
+    assert.deepEqual(rememberInstalled(null, source), expected);
 });
 
 test('forgets an install by id or by entry URL', () => {
