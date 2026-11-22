@@ -137,3 +137,16 @@ export function scriptIdFor(name, existingIds = []) {
     }
     return candidate;
 }
+
+/**
+ * Normalise persisted script records.
+ *
+ * Older records predate the enable flag, so "missing" means enabled; a record
+ * without an id or source cannot be run and is dropped.
+ */
+export function normalizeScriptRecords(records) {
+    if (!Array.isArray(records)) return [];
+    return records
+        .filter(record => record && typeof record.id === 'string' && typeof record.source === 'string')
+        .map(record => ({ ...record, enabled: record.enabled !== false }));
+}

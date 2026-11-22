@@ -72,6 +72,15 @@
     position: fixed;
     z-index: 10000;
     inset: 0;
+    /*
+     * On phones SillyTavern sets `html { height: 0; transform: ... }`, which makes
+     * the root the containing block for fixed descendants; `inset: 0` then
+     * resolves to a zero-height box and the panel never renders. Viewport units
+     * are independent of the containing block, so state the height explicitly.
+     */
+    height: 100vh;
+    height: 100dvh;
+    min-height: 100vh;
     display: none;
     align-items: stretch;
     justify-content: flex-end;

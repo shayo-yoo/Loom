@@ -1,5 +1,7 @@
 # Change Log
 
+- [CHG-20261122-036](history/recent/CHG-20261122-036.md): Script enable/disable, with boot skipping disabled scripts (0.32.0).
+- [CHG-20261122-035](history/recent/CHG-20261122-035.md): Phone panel never rendered — SillyTavern's transformed zero-height root collapsed fixed overlays; viewport-unit height and top anchoring fix it (0.32.0).
 - [CHG-20261122-034](history/recent/CHG-20261122-034.md): Extension management v2 (enable/disable, reload, metadata rows), lightweight scripts, and a 390px mobile check (0.31.0).
 - [CHG-20261122-033](history/recent/CHG-20261122-033.md): `worlds.entries` pagination and search (breaking page object), manager paging/search, save status fix (0.30.0).
 - [CHG-20261122-032](history/recent/CHG-20261122-032.md): `worlds.rename` can migrate character-card links when asked (`migrateCards`) and separately authorised; embedded books still block (0.29.0).
