@@ -1,5 +1,7 @@
 # Change Log
 
+- [CHG-20261122-040](history/recent/CHG-20261122-040.md): Composite components — a named view tree registered as a reusable component (0.34.0).
+- [CHG-20261122-039](history/recent/CHG-20261122-039.md): Identity and contract gaps — package `author`, content hash over real package content, capability `errors`/`compatibility`, and a data-type registry (0.34.0).
 - [CHG-20261122-038](history/recent/CHG-20261122-038.md): Collapsible panel sections, package rescan, and in-place script editing (0.33.0).
 - [CHG-20261122-037](history/recent/CHG-20261122-037.md): 停用 was wired to 启用 (inverted `data-enabled`), causing "Extension is already loaded"; toggle fixed and driven by real clicks in the harness (0.32.1).
 - [CHG-20261122-036](history/recent/CHG-20261122-036.md): Script enable/disable, with boot skipping disabled scripts (0.32.0).

@@ -5,23 +5,27 @@
       "id": "hello-loom",
       "name": "Hello Loom",
       "version": "0.1.0",
+      "author": "loom",
       "description": "Loom 的示例扩展：注册一个问候能力，并把调用次数持久化。",
       "manifest": "extensions/hello-loom/manifest.json",
       "entry": "extensions/hello-loom/index.js",
       "dependencies": [],
-      "permissions": []
+      "permissions": [],
+      "contentHash": "fnv1a64:99165e1c4d89f3dc"
     },
     {
       "id": "world-book-manager",
       "name": "世界书管理器",
       "version": "0.1.0",
+      "author": "loom",
       "description": "浏览世界书、编辑条目内容与启用状态，并显示真实保存结果。",
       "manifest": "extensions/world-book-manager/manifest.json",
       "entry": "extensions/world-book-manager/index.js",
       "dependencies": [],
       "permissions": [
         "host.worldinfo.write"
-      ]
+      ],
+      "contentHash": "fnv1a64:8180d8a689bdddc9"
     }
   ]
 }

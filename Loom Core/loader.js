@@ -158,6 +158,7 @@ export function createExtensionLoader(core) {
                 author: typeof manifest.author === 'string' ? manifest.author : undefined,
                 declaredId: typeof manifest.declaredId === 'string' ? manifest.declaredId : undefined,
                 content: manifest.content,
+                contentHash: typeof manifest.contentHash === 'string' ? manifest.contentHash : undefined,
             },
         };
     }

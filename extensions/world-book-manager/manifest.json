@@ -2,6 +2,7 @@
     "id": "world-book-manager",
     "name": "世界书管理器",
     "version": "0.1.0",
+    "author": "loom",
     "description": "浏览世界书、编辑条目内容与启用状态，并显示真实保存结果。",
     "entry": "index.js",
     "dependencies": [],

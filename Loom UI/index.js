@@ -19,6 +19,7 @@ import {
     serializeView,
 } from './views.js';
 import { serializeNode } from './view-tree.js';
+import { registerCompositeComponent } from './composite.js';
 import { escapeHtml } from './dom.js';
 import { SETTINGS_ENTRY_ID, buildSettingsEntryHtml, summarizeForSettings } from './settings.js';
 import {
@@ -217,7 +218,17 @@ async function fetchManifest(url) {
 
 async function importSource(source) {
     const manifest = source.manifest ? await fetchManifest(source.manifest) : null;
-    const options = manifest ? { manifest } : {};
+    // The generated index owns the package fingerprint (manifest + entry source);
+    // pass it through so Core registers the real content identity instead of
+    // falling back to whatever the module claims.
+    const manifestWithHash = manifest || source.contentHash
+        ? {
+            ...(manifest ?? {}),
+            ...(source.author ? { author: source.author } : {}),
+            ...(source.contentHash ? { contentHash: source.contentHash } : {}),
+        }
+        : null;
+    const options = manifestWithHash ? { manifest: manifestWithHash } : {};
     let result;
     try {
         result = await runtime.importExtension(source.entry, options);
@@ -391,12 +402,14 @@ async function runScript(record) {
     try {
         const result = await runtime.importExtension(url, {
             // Identity comes from the script record, so the source only needs hooks.
+            // `content` lets Core fingerprint the actual source text.
             manifest: {
                 id: record.id,
                 name: record.name || record.id,
                 version: '0.0.0',
                 dependencies: [],
                 permissions: [],
+                content: record.source,
             },
         });
         if (result?.state === 'failed' || result?.error) {
@@ -512,6 +525,7 @@ function renderInstaller() {
         : rows.map(row => {
             const disabled = isDisabled(row.id);
             const detail = [
+                row.author ? `作者：${row.author}` : '',
                 row.version ? `v${row.version}` : '',
                 row.bundled ? '内置' : '手动安装',
                 disabled ? '已停用' : row.state,
@@ -750,6 +764,11 @@ function installUiApi() {
                 : registerComponent(EXTENSION_ID, extensionIdOrComponent)
         ),
         listComponents: (extensionId) => listComponents(extensionId),
+        registerCompositeComponent: (extensionIdOrDefinition, maybeDefinition) => (
+            typeof extensionIdOrDefinition === 'string'
+                ? registerCompositeComponent(extensionIdOrDefinition, maybeDefinition)
+                : registerCompositeComponent(EXTENSION_ID, extensionIdOrDefinition)
+        ),
         createView: (extensionIdOrOptions, maybeOptions) => (
             typeof extensionIdOrOptions === 'string'
                 ? createView(extensionIdOrOptions, maybeOptions)

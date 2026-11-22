@@ -3,7 +3,7 @@ import { createExtensionLoader } from './loader.js';
 const EXTENSION_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/i;
 const PERMISSION_PATTERN = /^[a-z0-9][a-z0-9._:-]*$/i;
 const EVENT_NAME_PATTERN = /^[a-z0-9][a-z0-9:._-]*$/i;
-const LOOM_VERSION = '0.33.0';
+const LOOM_VERSION = '0.34.0';
 const capabilityRegistry = new Map();
 const extensionRegistry = new Map();
 const eventListeners = new Map();
@@ -47,6 +47,53 @@ function normalizePermissionList(permissions) {
         return permission;
     }))];
     return Object.freeze(unique);
+}
+
+/**
+ * Declared error codes. The interface contract asks an interface to describe the
+ * errors it may produce; this is metadata for callers and tooling, not a runtime
+ * guarantee (a handler can still fail with any code).
+ */
+function normalizeErrorDeclarations(errors) {
+    if (errors === undefined) return Object.freeze([]);
+    if (!Array.isArray(errors)) throw new TypeError('Capability errors must be an array.');
+    const normalized = errors.map(entry => {
+        if (!entry || typeof entry !== 'object') throw new TypeError('Each capability error must be an object.');
+        if (typeof entry.code !== 'string' || !/^[A-Z0-9_]+$/.test(entry.code)) {
+            throw new TypeError('Capability error code must be UPPER_SNAKE_CASE.');
+        }
+        if (entry.description !== undefined && typeof entry.description !== 'string') {
+            throw new TypeError('Capability error description must be a string.');
+        }
+        return Object.freeze({ code: entry.code, description: entry.description ?? '' });
+    });
+    return Object.freeze(normalized);
+}
+
+/** Compatibility metadata: when an interface appeared, and whether it is deprecated. */
+function normalizeCompatibility(compatibility) {
+    if (compatibility === undefined) return null;
+    if (!compatibility || typeof compatibility !== 'object' || Array.isArray(compatibility)) {
+        throw new TypeError('Capability compatibility must be an object.');
+    }
+    const allowed = ['since', 'deprecated', 'notes'];
+    for (const key of Object.keys(compatibility)) {
+        if (!allowed.includes(key)) throw new TypeError(`Unknown capability compatibility field: ${key}`);
+    }
+    if (compatibility.since !== undefined && typeof compatibility.since !== 'string') {
+        throw new TypeError('Capability compatibility.since must be a string.');
+    }
+    if (compatibility.deprecated !== undefined && typeof compatibility.deprecated !== 'boolean') {
+        throw new TypeError('Capability compatibility.deprecated must be a boolean.');
+    }
+    if (compatibility.notes !== undefined && typeof compatibility.notes !== 'string') {
+        throw new TypeError('Capability compatibility.notes must be a string.');
+    }
+    return Object.freeze({
+        since: compatibility.since ?? null,
+        deprecated: compatibility.deprecated ?? false,
+        notes: compatibility.notes ?? '',
+    });
 }
 
 /**
@@ -252,6 +299,10 @@ function snapshotCapability(capability) {
         input: capability.input === null ? null : structuredClone(capability.input),
         output: capability.output === null ? null : structuredClone(capability.output),
         permissions: [...capability.permissions],
+        errors: structuredClone(capability.errors ?? []),
+        compatibility: capability.compatibility === null || capability.compatibility === undefined
+            ? null
+            : structuredClone(capability.compatibility),
     };
 }
 
@@ -328,6 +379,8 @@ export function registerCapability(extensionId, capability) {
         ...(capability.output === undefined ? [] : checkSchemaDefinition(capability.output)),
     ];
     if (schemaErrors.length) throw new TypeError(`Invalid capability schema: ${schemaErrors.join(' ')}`);
+    const errors = normalizeErrorDeclarations(capability.errors);
+    const compatibility = normalizeCompatibility(capability.compatibility);
 
     const key = `${extensionId}:${capability.id}`;
     if (capabilityRegistry.has(key)) {
@@ -340,6 +393,8 @@ export function registerCapability(extensionId, capability) {
         input: capability.input === undefined ? null : structuredClone(capability.input),
         output: capability.output === undefined ? null : structuredClone(capability.output),
         permissions: normalizePermissionList(capability.permissions),
+        errors,
+        compatibility,
         execute: capability.execute,
     });
     capabilityRegistry.set(key, { extensionId, capability: record });
@@ -438,6 +493,71 @@ export function listCapabilities(extensionId) {
     return [...capabilityRegistry.values()]
         .filter(entry => extensionId === undefined || entry.extensionId === extensionId)
         .map(entry => ({ extensionId: entry.extensionId, ...snapshotCapability(entry.capability) }));
+}
+
+/**
+ * Data-type registry.
+ *
+ * Extensions define their own data shapes; this registry gives those shapes a
+ * stable identity (`extensionId:typeId`) so an interface can name the types it
+ * exchanges, per the interface contract. Loom does not interpret the schema; it
+ * only validates that it is a JSON-Schema-subset definition.
+ */
+const typeRegistry = new Map();
+
+function snapshotType(entry) {
+    return {
+        extensionId: entry.extensionId,
+        id: entry.type.id,
+        name: entry.type.name,
+        description: entry.type.description,
+        schema: entry.type.schema === null ? null : structuredClone(entry.type.schema),
+    };
+}
+
+export function registerType(extensionId, definition) {
+    requireRegisteredExtension(extensionId, 'registering a type');
+    if (!definition || typeof definition !== 'object') {
+        throw new TypeError('Type metadata must be an object.');
+    }
+    validateId(definition.id, 'Type');
+    if (typeof definition.name !== 'string' || definition.name.trim() === '') {
+        throw new TypeError('Type name is required.');
+    }
+    if (definition.description !== undefined && typeof definition.description !== 'string') {
+        throw new TypeError('Type description must be a string.');
+    }
+    if (definition.schema !== undefined) {
+        const errors = checkSchemaDefinition(definition.schema);
+        if (errors.length) throw new TypeError(`Invalid type schema: ${errors.join(' ')}`);
+    }
+    const key = `${extensionId}:${definition.id}`;
+    if (typeRegistry.has(key)) throw new Error(`Type already registered: ${key}`);
+    const entry = {
+        extensionId,
+        type: Object.freeze({
+            id: definition.id,
+            name: definition.name.trim(),
+            description: typeof definition.description === 'string' ? definition.description : '',
+            schema: definition.schema === undefined ? null : structuredClone(definition.schema),
+        }),
+    };
+    typeRegistry.set(key, entry);
+    return snapshotType(entry);
+}
+
+export function listTypes(extensionId) {
+    if (extensionId !== undefined) validateId(extensionId, 'Extension');
+    return [...typeRegistry.values()]
+        .filter(entry => extensionId === undefined || entry.extensionId === extensionId)
+        .map(snapshotType);
+}
+
+export function getType(extensionId, typeId) {
+    validateId(extensionId, 'Extension');
+    validateId(typeId, 'Type');
+    const entry = typeRegistry.get(`${extensionId}:${typeId}`);
+    return entry ? snapshotType(entry) : null;
 }
 
 /**
@@ -978,6 +1098,9 @@ export function unregisterExtension(extensionId) {
     for (const [key, entry] of capabilityRegistry) {
         if (entry.extensionId === extensionId) capabilityRegistry.delete(key);
     }
+    for (const [key, entry] of typeRegistry) {
+        if (entry.extensionId === extensionId) typeRegistry.delete(key);
+    }
     savePermissionSnapshot();
     return { removed: true, cleanupErrors };
 }
@@ -1003,6 +1126,7 @@ export function getRuntimeInfo() {
         activeExtensionCount: states.filter(state => state.state === 'active').length,
         failedExtensionCount: states.filter(state => state.state === 'failed').length,
         capabilityCount: capabilityRegistry.size,
+        typeCount: typeRegistry.size,
         eventCount: eventListeners.size,
         listenerCount: countListeners(),
         stateKeyCount: countStateKeys(),
@@ -1043,6 +1167,9 @@ const api = Object.freeze({
     listIdentityConflicts,
     computeContentHash,
     listCapabilities,
+    registerType,
+    listTypes,
+    getType,
     executeCapability,
     subscribe,
     emit,

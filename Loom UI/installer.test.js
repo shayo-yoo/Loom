@@ -38,9 +38,11 @@ test('normalises the bundled index and reports broken entries', () => {
         id: 'hello-loom',
         name: 'Hello Loom',
         version: '0.1.0',
+        author: null,
         description: '',
         manifest: `${BASE}extensions/hello-loom/manifest.json`,
         entry: `${BASE}extensions/hello-loom/index.js`,
+        contentHash: null,
         bundled: true,
     }]);
     assert.equal(problems.length, 3, 'invalid id, missing entry and non-object are all reported');
@@ -138,12 +140,12 @@ test('describes installed entries with runtime state, including failures', () =>
     assert.deepEqual(describeInstalled(installed, states), [
         {
             id: 'hello-loom', entry: `${BASE}extensions/hello-loom/index.js`, bundled: true,
-            state: 'active', name: 'Hello Loom', version: '0.1.0',
+            state: 'active', name: 'Hello Loom', version: '0.1.0', author: '',
             permissions: ['host.chat.read'], dependencies: ['loom-host'], error: '',
         },
         {
             id: 'gone', entry: 'https://example.com/gone.js', bundled: false,
-            state: 'failed', name: 'Gone', version: '', permissions: [], dependencies: [], error: 'boom',
+            state: 'failed', name: 'Gone', version: '', author: '', permissions: [], dependencies: [], error: 'boom',
         },
     ]);
     assert.equal(describeInstalled(installed, []).find(entry => entry.id === 'gone').state, 'missing',
