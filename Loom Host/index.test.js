@@ -117,6 +117,9 @@ test('registers the host adapter and its capabilities', () => {
             'chat.edit',
             'chat.messages',
             'context.snapshot',
+            'prompt.clear',
+            'prompt.list',
+            'prompt.set',
             'settings.get',
             'settings.keys',
             'settings.remove',
@@ -162,6 +165,10 @@ test('declares the write permission only on the mutating settings capabilities',
     assert.deepEqual(declared['characters.update'], ['host.characters.write']);
     assert.deepEqual(declared['characters.create'], ['host.characters.manage']);
     assert.deepEqual(declared['characters.remove'], ['host.characters.manage']);
+    assert.deepEqual(declared['prompt.set'], ['host.prompt.inject']);
+    assert.deepEqual(declared['prompt.clear'], ['host.prompt.inject']);
+    assert.deepEqual(declared['prompt.list'], ['host.prompt.inject'],
+        'even reading the injections is gated: they are derived from the user context');
     assert.deepEqual(declared['characters.get'], [], 'reading a card stays ungated');
     assert.deepEqual(declared['worlds.export'], [], 'export is a read');
     assert.deepEqual(declared['characters.get'], []);
@@ -1302,6 +1309,156 @@ test('fails settings calls with a structured error when the host settings are un
     const result = await executeCapability(EXTENSION_ID, 'settings.keys', null, { caller: consumerId });
     assert.equal(result.success, false);
     assert.equal(result.error.code, 'HOST_UNAVAILABLE');
+});
+
+function stubPromptHost() {
+    // Mirrors SillyTavern: setExtensionPrompt stores into a shared map keyed by the
+    // caller-chosen key; deleting the entry is how an injection is removed.
+    const extensionPrompts = {};
+    const calls = [];
+    stubHost({
+        chat: [],
+        extensionPrompts,
+        setExtensionPrompt: (key, value, position, depth, scan, role) => {
+            calls.push({ key, value, position, depth, scan, role });
+            extensionPrompts[key] = { value: String(value), position: Number(position), depth: Number(depth), scan: Boolean(scan), role: Number(role) };
+        },
+    });
+    return { extensionPrompts, calls, restore: () => {} };
+}
+
+test('prompt.set writes a namespaced injection and reports what was stored', async () => {
+    const host = stubPromptHost();
+    registerConsumer();
+    grantPermission(consumerId, 'host.prompt.inject');
+    try {
+        const result = await executeCapability(EXTENSION_ID, 'prompt.set',
+            { text: 'stay in character', depth: 2, role: 'user' }, { caller: consumerId });
+
+        assert.deepEqual(result, {
+            success: true,
+            data: { key: 'default', position: 'in_chat', depth: 2, role: 'user', length: 'stay in character'.length },
+        });
+        assert.deepEqual(host.calls, [{
+            key: `${consumerId}:default`, value: 'stay in character', position: 1, depth: 2, scan: false, role: 1,
+        }].map(call => ({ ...call, key: `loom:${call.key}` })));
+        assert.equal(host.extensionPrompts[`loom:${consumerId}:default`].value, 'stay in character',
+            'the caller-chosen key is namespaced so callers cannot collide');
+    } finally {
+        host.restore();
+    }
+});
+
+test('prompt.set validates its input and reports a host that dropped the write', async () => {
+    const host = stubPromptHost();
+    registerConsumer();
+    grantPermission(consumerId, 'host.prompt.inject');
+    try {
+        for (const input of [
+            {},
+            { text: '' },
+            { text: 'x', position: 'middle' },
+            { text: 'x', role: 'root' },
+            { text: 'x', depth: -1 },
+            { text: 'x', key: 'bad key' },
+        ]) {
+            const result = await executeCapability(EXTENSION_ID, 'prompt.set', input, { caller: consumerId });
+            assert.equal(result.success, false, JSON.stringify(input));
+        }
+        assert.deepEqual(host.calls, [], 'invalid input never reaches the host');
+    } finally {
+        host.restore();
+    }
+
+    // A host whose setter silently ignores the write must not look like success.
+    stubHost({
+        chat: [],
+        extensionPrompts: {},
+        setExtensionPrompt: () => {},
+    });
+    const dropped = await executeCapability(EXTENSION_ID, 'prompt.set', { text: 'x' }, { caller: consumerId });
+    assert.equal(dropped.error.code, 'PROMPT_INJECT_FAILED');
+});
+
+test('prompt.list shows only the caller\'s own injections', async () => {
+    const host = stubPromptHost();
+    registerConsumer();
+    grantPermission(consumerId, 'host.prompt.inject');
+    globalThis.Loom.registerExtension({ id: 'other-caller', name: 'Other' });
+    globalThis.Loom.grantPermission('other-caller', 'host.prompt.inject');
+    try {
+        await executeCapability(EXTENSION_ID, 'prompt.set', { text: 'mine', key: 'a' }, { caller: consumerId });
+        await executeCapability(EXTENSION_ID, 'prompt.set', { text: 'theirs', key: 'a' }, { caller: 'other-caller' });
+
+        const listed = await executeCapability(EXTENSION_ID, 'prompt.list', null, { caller: consumerId });
+        assert.deepEqual(listed.data.map(row => [row.key, row.preview, row.length]), [['a', 'mine', 4]],
+            'the other extension\'s entry is invisible');
+        assert.equal(listed.data[0].position, 'in_chat');
+        assert.equal(listed.data[0].role, 'system');
+    } finally {
+        globalThis.Loom.unregisterExtension('other-caller');
+        host.restore();
+    }
+});
+
+test('prompt.clear removes one key or all of them, and never another caller\'s', async () => {
+    const host = stubPromptHost();
+    registerConsumer();
+    grantPermission(consumerId, 'host.prompt.inject');
+    globalThis.Loom.registerExtension({ id: 'other-caller', name: 'Other' });
+    globalThis.Loom.grantPermission('other-caller', 'host.prompt.inject');
+    try {
+        await executeCapability(EXTENSION_ID, 'prompt.set', { text: 'a', key: 'a' }, { caller: consumerId });
+        await executeCapability(EXTENSION_ID, 'prompt.set', { text: 'b', key: 'b' }, { caller: consumerId });
+        await executeCapability(EXTENSION_ID, 'prompt.set', { text: 'o', key: 'a' }, { caller: 'other-caller' });
+
+        const one = await executeCapability(EXTENSION_ID, 'prompt.clear', { key: 'a' }, { caller: consumerId });
+        assert.deepEqual(one.data, { cleared: ['a'] });
+        assert.equal(host.extensionPrompts[`loom:other-caller:a`]?.value, 'o', 'the other caller\'s key survives');
+
+        const missing = await executeCapability(EXTENSION_ID, 'prompt.clear', { key: 'a' }, { caller: consumerId });
+        assert.deepEqual(missing.data, { cleared: [] }, 'clearing twice is not an error');
+
+        const all = await executeCapability(EXTENSION_ID, 'prompt.clear', { all: true }, { caller: consumerId });
+        assert.deepEqual(all.data, { cleared: ['b'] });
+        assert.deepEqual(Object.keys(host.extensionPrompts), [`loom:other-caller:a`]);
+
+        const bad = await executeCapability(EXTENSION_ID, 'prompt.clear', {}, { caller: consumerId });
+        assert.equal(bad.error.code, 'INVALID_INPUT');
+    } finally {
+        globalThis.Loom.unregisterExtension('other-caller');
+        host.restore();
+    }
+});
+
+test('prompt injection is gated and cleaned up when the caller unregisters', async () => {
+    const host = stubPromptHost();
+    registerConsumer();
+    globalThis.Loom.registerExtension({ id: 'prompt-owner', name: 'Prompt Owner' });
+    try {
+        const denied = await executeCapability(EXTENSION_ID, 'prompt.set', { text: 'x' }, { caller: 'prompt-owner' });
+        assert.equal(denied.error.code, 'PERMISSION_DENIED');
+        assert.deepEqual(denied.error.details.missing, ['host.prompt.inject']);
+        assert.deepEqual(host.calls, []);
+
+        globalThis.Loom.grantPermission('prompt-owner', 'host.prompt.inject');
+        await executeCapability(EXTENSION_ID, 'prompt.set', { text: 'temporary' }, { caller: 'prompt-owner' });
+        assert.equal(Object.keys(host.extensionPrompts).length, 1);
+
+        globalThis.Loom.unregisterExtension('prompt-owner');
+        assert.deepEqual(host.extensionPrompts, {}, 'unloading the owner removes its injection');
+    } finally {
+        globalThis.Loom.unregisterExtension('prompt-owner');
+        host.restore();
+    }
+});
+
+test('prompt capabilities report an unsupported host', async () => {
+    stubHost({ chat: [] });
+    registerConsumer();
+    grantPermission(consumerId, 'host.prompt.inject');
+    const result = await executeCapability(EXTENSION_ID, 'prompt.set', { text: 'x' }, { caller: consumerId });
+    assert.equal(result.error.code, 'HOST_UNSUPPORTED');
 });
 
 function stubChatHost(options = {}) {

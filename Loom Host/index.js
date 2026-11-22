@@ -1,7 +1,7 @@
 import '../Loom%20Core/index.js';
 
 const EXTENSION_ID = 'loom-host';
-const HOST_VERSION = '0.34.0';
+const HOST_VERSION = '0.35.0';
 const runtime = globalThis.Loom;
 
 const nullInput = { type: 'null' };
@@ -1976,6 +1976,227 @@ const chatDeleteCapability = {
     },
 };
 
+/**
+ * Prompt injection — writing into the generation context.
+ *
+ * This is the most invasive family the adapter offers: an injected prompt becomes
+ * part of what the model reads. It therefore gets its own permission
+ * (`host.prompt.inject`) that no other capability declares, keys are namespaced
+ * per caller so one extension cannot overwrite or clear another's entry, and every
+ * key is registered as an unregister cleanup so nothing survives its owner.
+ *
+ * SillyTavern exposes `setExtensionPrompt` but not the position/role enums, so the
+ * numeric values are mirrored here (same deliberate duplication as the world-entry
+ * defaults: revisit on a host upgrade).
+ */
+const PROMPT_INJECT_SCOPE = 'host.prompt.inject';
+const PROMPT_KEY_PREFIX = 'loom';
+const PROMPT_TEXT_LIMIT = 20000;
+const PROMPT_DEPTH_LIMIT = 10000;
+
+/** Mirrors SillyTavern's `extension_prompt_types`. */
+const PROMPT_POSITIONS = Object.freeze({ in_prompt: 0, in_chat: 1, before_prompt: 2 });
+const DEFAULT_PROMPT_POSITION = 'in_chat';
+const DEFAULT_PROMPT_DEPTH = 4;
+
+/** Mirrors SillyTavern's `extension_prompt_roles`. */
+const PROMPT_ROLES = Object.freeze({ system: 0, user: 1, assistant: 2 });
+const DEFAULT_PROMPT_ROLE = 'system';
+
+const promptKeyPattern = /^[a-z0-9][a-z0-9._-]*$/i;
+const injectedKeys = new Map();
+
+function stPromptKey(caller, key) {
+    return `${PROMPT_KEY_PREFIX}:${caller}:${key}`;
+}
+
+/** Strip the namespacing so callers only ever see their own key names. */
+function callerKeyOf(caller, stKey) {
+    const prefix = `${PROMPT_KEY_PREFIX}:${caller}:`;
+    return stKey.startsWith(prefix) ? stKey.slice(prefix.length) : null;
+}
+
+function trackInjection(caller, stKey) {
+    if (!injectedKeys.has(caller)) {
+        injectedKeys.set(caller, new Set());
+        // One cleanup per caller: every key it wrote is removed when it unloads.
+        runtime?.addCleanup?.(caller, () => {
+            const context = globalThis.SillyTavern?.getContext?.();
+            for (const key of injectedKeys.get(caller) ?? []) {
+                if (context?.extensionPrompts) delete context.extensionPrompts[key];
+            }
+            injectedKeys.delete(caller);
+        });
+    }
+    injectedKeys.get(caller).add(stKey);
+}
+
+function readInjection(context, stKey) {
+    const entry = context?.extensionPrompts?.[stKey];
+    return entry && typeof entry === 'object' ? entry : null;
+}
+
+const promptSetCapability = {
+    id: 'prompt.set',
+    name: 'inject prompt',
+    description: 'Write one prompt injection into the generation context; keyed per caller. Requires host.prompt.inject.',
+    permissions: [PROMPT_INJECT_SCOPE],
+    input: {
+        type: 'object',
+        required: ['text'],
+        properties: {
+            text: { type: 'string', minLength: 1, maxLength: PROMPT_TEXT_LIMIT },
+            position: { type: 'string', enum: Object.keys(PROMPT_POSITIONS) },
+            depth: { type: 'integer', minimum: 0, maximum: PROMPT_DEPTH_LIMIT },
+            role: { type: 'string', enum: Object.keys(PROMPT_ROLES) },
+            key: { type: 'string', minLength: 1, maxLength: 64 },
+        },
+        additionalProperties: false,
+    },
+    output: {
+        type: 'object',
+        required: ['key', 'position', 'depth', 'role', 'length'],
+        properties: {
+            key: { type: 'string' },
+            position: { type: 'string' },
+            depth: { type: 'integer', minimum: 0 },
+            role: { type: 'string' },
+            length: { type: 'integer', minimum: 0 },
+        },
+        additionalProperties: false,
+    },
+    execute: (input, contextInfo) => {
+        const context = getHostContext();
+        if (typeof context.setExtensionPrompt !== 'function' || !context.extensionPrompts) {
+            throw typedError('HOST_UNSUPPORTED', 'This SillyTavern version does not expose prompt injection.');
+        }
+        const caller = contextInfo?.caller;
+        if (!caller) throw typedError('CALLER_REQUIRED', 'Prompt injection requires a caller identity.');
+
+        const key = input.key ?? 'default';
+        if (!promptKeyPattern.test(key)) {
+            throw typedError('INVALID_INPUT', 'Prompt key must be an identifier.', { key });
+        }
+        const position = input.position ?? DEFAULT_PROMPT_POSITION;
+        const role = input.role ?? DEFAULT_PROMPT_ROLE;
+        const depth = input.depth ?? DEFAULT_PROMPT_DEPTH;
+        const stKey = stPromptKey(caller, key);
+
+        context.setExtensionPrompt(stKey, input.text, PROMPT_POSITIONS[position], depth, false, PROMPT_ROLES[role]);
+
+        // Read back: a write the host did not store must not be reported as success.
+        const stored = readInjection(context, stKey);
+        if (!stored || stored.value !== input.text) {
+            throw typedError('PROMPT_INJECT_FAILED', 'The host did not store the injection.', { key });
+        }
+        trackInjection(caller, stKey);
+        return { key, position, depth, role, length: input.text.length };
+    },
+};
+
+const promptClearCapability = {
+    id: 'prompt.clear',
+    name: 'clear prompt injection',
+    description: 'Remove this caller\'s prompt injections (one key, or all of them). Requires host.prompt.inject.',
+    permissions: [PROMPT_INJECT_SCOPE],
+    input: {
+        type: 'object',
+        properties: {
+            key: { type: 'string', minLength: 1, maxLength: 64 },
+            all: { type: 'boolean' },
+        },
+        additionalProperties: false,
+    },
+    output: {
+        type: 'object',
+        required: ['cleared'],
+        properties: { cleared: { type: 'array', items: { type: 'string' } } },
+        additionalProperties: false,
+    },
+    execute: (input, contextInfo) => {
+        const context = getHostContext();
+        const caller = contextInfo?.caller;
+        if (!caller) throw typedError('CALLER_REQUIRED', 'Prompt injection requires a caller identity.');
+        if (input.key === undefined && input.all !== true) {
+            throw typedError('INVALID_INPUT', 'Pass a key or all: true.');
+        }
+
+        const prefix = `${PROMPT_KEY_PREFIX}:${caller}:`;
+        const targets = [];
+        const tracked = injectedKeys.get(caller) ?? new Set();
+        if (input.all === true) {
+            for (const stKey of tracked) targets.push(stKey);
+            for (const stKey of Object.keys(context.extensionPrompts ?? {})) {
+                if (stKey.startsWith(prefix) && !targets.includes(stKey)) targets.push(stKey);
+            }
+        } else if (promptKeyPattern.test(input.key)) {
+            targets.push(stPromptKey(caller, input.key));
+        } else {
+            throw typedError('INVALID_INPUT', 'Prompt key must be an identifier.', { key: input.key });
+        }
+
+        const cleared = [];
+        for (const stKey of targets) {
+            const key = callerKeyOf(caller, stKey);
+            if (key === null) continue;
+            if (context.extensionPrompts && Object.hasOwn(context.extensionPrompts, stKey)) {
+                delete context.extensionPrompts[stKey];
+                cleared.push(key);
+                tracked.delete(stKey);
+            }
+        }
+        if (tracked.size === 0) injectedKeys.delete(caller);
+        return { cleared };
+    },
+};
+
+const promptListCapability = {
+    id: 'prompt.list',
+    name: 'list prompt injections',
+    description: 'List only this caller\'s prompt injections, with a short preview. Requires host.prompt.inject.',
+    permissions: [PROMPT_INJECT_SCOPE],
+    input: nullInput,
+    output: {
+        type: 'array',
+        items: {
+            type: 'object',
+            required: ['key', 'position', 'depth', 'role', 'length', 'preview'],
+            properties: {
+                key: { type: 'string' },
+                position: { type: 'string' },
+                depth: { type: 'integer', minimum: 0 },
+                role: { type: 'string' },
+                length: { type: 'integer', minimum: 0 },
+                preview: { type: 'string' },
+            },
+            additionalProperties: false,
+        },
+    },
+    execute: (input, contextInfo) => {
+        const context = getHostContext();
+        const caller = contextInfo?.caller;
+        if (!caller) throw typedError('CALLER_REQUIRED', 'Prompt injection requires a caller identity.');
+
+        const positionNames = new Map(Object.entries(PROMPT_POSITIONS).map(([name, value]) => [value, name]));
+        const roleNames = new Map(Object.entries(PROMPT_ROLES).map(([name, value]) => [value, name]));
+        const rows = [];
+        for (const [stKey, entry] of Object.entries(context.extensionPrompts ?? {})) {
+            const key = callerKeyOf(caller, stKey);
+            if (key === null || !entry || typeof entry !== 'object') continue;
+            const text = String(entry.value ?? '');
+            rows.push({
+                key,
+                position: positionNames.get(Number(entry.position)) ?? 'unknown',
+                depth: Number.isFinite(entry.depth) ? Math.max(0, Math.trunc(entry.depth)) : 0,
+                role: roleNames.get(Number(entry.role)) ?? 'system',
+                length: text.length,
+                preview: text.slice(0, 80),
+            });
+        }
+        return rows.sort((left, right) => left.key.localeCompare(right.key));
+    },
+};
+
 const CAPABILITIES = Object.freeze([
     snapshotCapability,
     charactersCapability,
@@ -1998,6 +2219,9 @@ const CAPABILITIES = Object.freeze([
     chatAppendCapability,
     chatEditCapability,
     chatDeleteCapability,
+    promptSetCapability,
+    promptClearCapability,
+    promptListCapability,
     settingsGetCapability,
     settingsSetCapability,
     settingsRemoveCapability,

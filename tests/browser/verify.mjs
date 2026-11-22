@@ -1719,6 +1719,11 @@ async function probePanelSections(cdp) {
 
 async function probeIdentityAndMetadata(cdp) {
     // Package identity: author + id + content hash from the generated index.
+    await cdp.waitFor("return window.LoomUI?.isReady?.() === true;", SETTLE_TIMEOUT_MS, 'installer boot before identity');
+    await cdp.waitFor(
+        "return window.Loom?.listExtensions().some(entry => entry.id === 'hello-loom') ? true : false;",
+        SETTLE_TIMEOUT_MS, 'bundled package registered',
+    );
     const identity = await cdp.evaluate(`const entry = window.Loom.listExtensions().find(item => item.id === 'hello-loom');
         return entry ? { author: entry.author, identityKey: entry.identityKey, contentHash: entry.contentHash } : null;`);
     assertThat('a bundled package registers author, identity and content hash',
@@ -1762,6 +1767,100 @@ async function probeIdentityAndMetadata(cdp) {
         && metadata.typeGet?.schema?.required?.[0] === 'text' && metadata.typeCount >= 1
         && metadata.removed === null,
         JSON.stringify(metadata));
+}
+
+async function probePromptInjection(cdp) {
+    // A throwaway owner with the injection grant. The real host map is inspected
+    // directly, so this proves the injection reached SillyTavern, not just Loom.
+    const denied = await cdp.evaluate(`const Loom = window.Loom;
+        if (Loom.listExtensions().some(entry => entry.id === 'verify-noperm')) Loom.unregisterExtension('verify-noperm');
+        Loom.registerExtension({ id: 'verify-noperm', name: 'No Permission' });
+        const result = await Loom.executeCapability('loom-host', 'prompt.set', { text: 'x' }, { caller: 'verify-noperm' });
+        Loom.unregisterExtension('verify-noperm');
+        return result;`);
+    assertThat('prompt.set is denied without host.prompt.inject',
+        denied.success === false && denied.error?.code === 'PERMISSION_DENIED'
+        && denied.error.details?.missing?.[0] === 'host.prompt.inject',
+        JSON.stringify(denied));
+
+    const injected = await cdp.evaluate(`const Loom = window.Loom;
+        if (Loom.listExtensions().some(entry => entry.id === 'verify-prompt')) Loom.unregisterExtension('verify-prompt');
+        Loom.registerExtension({ id: 'verify-prompt', name: 'Prompt Probe' });
+        Loom.grantPermission('verify-prompt', 'host.prompt.inject');
+        const set = await Loom.executeCapability('loom-host', 'prompt.set',
+            { text: 'probe injection', key: 'main', depth: 3, role: 'user' }, { caller: 'verify-prompt' });
+        const context = window.SillyTavern.getContext();
+        const stored = context.extensionPrompts?.['loom:verify-prompt:main'] ?? null;
+        const listed = await Loom.executeCapability('loom-host', 'prompt.list', null, { caller: 'verify-prompt' });
+        return { set, stored, listed };`);
+    assertThat('prompt.set stores the injection in the host prompt map',
+        injected.set.success === true
+        && injected.stored?.value === 'probe injection'
+        && injected.stored?.position === 1 && injected.stored?.depth === 3 && injected.stored?.role === 1,
+        JSON.stringify(injected));
+    assertThat('prompt.list reports only the caller\'s injections',
+        Array.isArray(injected.listed?.data) && injected.listed.data.length === 1
+        && injected.listed.data[0].key === 'main' && injected.listed.data[0].position === 'in_chat'
+        && injected.listed.data[0].role === 'user',
+        JSON.stringify(injected.listed));
+
+    const cleared = await cdp.evaluate(`const Loom = window.Loom;
+        const context = window.SillyTavern.getContext();
+        const cleared = await Loom.executeCapability('loom-host', 'prompt.clear', { all: true }, { caller: 'verify-prompt' });
+        const afterClear = context.extensionPrompts?.['loom:verify-prompt:main'] ?? null;
+        // Re-inject, then unregister: the cleanup must remove it.
+        await Loom.executeCapability('loom-host', 'prompt.set', { text: 'left behind', key: 'stale' }, { caller: 'verify-prompt' });
+        Loom.unregisterExtension('verify-prompt');
+        return {
+            cleared,
+            afterClear,
+            afterUnregister: context.extensionPrompts?.['loom:verify-prompt:stale'] ?? null,
+            remaining: Object.keys(context.extensionPrompts ?? {}).filter(key => key.includes('verify-prompt')),
+        };`);
+    assertThat('prompt.clear removes the caller\'s injections',
+        cleared.cleared?.data?.cleared?.[0] === 'main' && cleared.afterClear === null,
+        JSON.stringify(cleared));
+    assertThat('unregistering the owner removes its injections',
+        cleared.afterUnregister === null && cleared.remaining.length === 0, JSON.stringify(cleared));
+}
+
+async function probeNativeSlot(cdp) {
+    // A view mounted into SillyTavern's own settings column, not a floating panel.
+    const mounted = await cdp.evaluate(`const Loom = window.Loom;
+        Loom.registerExtension({ id: 'verify-slot', name: 'Slot Probe' });
+        const view = window.LoomUI.mountToSlot('verify-slot', 'settings', {
+            root: { component: 'text', props: { text: 'loom slot probe' } },
+        });
+        const host = document.querySelector('#extensions_settings .loom-slot');
+        return {
+            mounted: Boolean(view),
+            inHost: Boolean(host),
+            hostExtension: host?.dataset.extension ?? null,
+            text: host?.textContent ?? '',
+            listed: window.LoomUI.listSlotMounts('verify-slot'),
+        };`);
+    assertThat('a view mounts into a native SillyTavern panel slot',
+        mounted.mounted === true && mounted.inHost === true && mounted.hostExtension === 'verify-slot'
+        && mounted.text.includes('loom slot probe')
+        && mounted.listed?.[0]?.slot === 'settings',
+        JSON.stringify(mounted));
+
+    const removed = await cdp.evaluate(`const removed = window.LoomUI.unmountFromSlot('verify-slot', 'settings');
+        const afterUnmount = document.querySelectorAll('#extensions_settings .loom-slot[data-extension="verify-slot"]').length;
+        window.LoomUI.mountToSlot('verify-slot', 'settings', { root: { component: 'text', props: { text: 'again' } } });
+        window.Loom.unregisterExtension('verify-slot');
+        const afterUnregister = document.querySelectorAll('#extensions_settings .loom-slot[data-extension="verify-slot"]').length;
+        return { removed, afterUnmount, afterUnregister };`);
+    assertThat('slot views are removed on unmount and on unregister',
+        removed.removed === true && removed.afterUnmount === 0 && removed.afterUnregister === 0,
+        JSON.stringify(removed));
+
+    const unknown = await cdp.evaluate(`try {
+        window.LoomUI.mountToSlot('loom-ui', 'not-a-slot', { root: { component: 'text', props: { text: 'x' } } });
+        return { threw: false };
+    } catch (error) { return { threw: true, message: String(error.message) }; }`);
+    assertThat('an unknown slot is rejected', unknown.threw === true && /Unknown UI slot/.test(unknown.message),
+        JSON.stringify(unknown));
 }
 
 async function probeWorldRename(cdp) {
@@ -2113,26 +2212,36 @@ async function probeMobileLayout(cdp) {
             // (pending requests are common during a full run). Hide it for the
             // hit-test only — the question is whether the panel itself is visible.
             const consent = document.getElementById('loom_consent');
-            const consentWasVisible = Boolean(consent && !consent.hidden
-                && getComputedStyle(consent).display !== 'none'
-                && consent.getBoundingClientRect().height > 0);
-            if (consentWasVisible) consent.style.visibility = 'hidden';
-            // SillyTavern may leave its own modal/loader above everything (a probe
-            // can trigger one). Hide unrelated overlays for the hit-test and record
-            // what was blocking, so a real panel failure stays distinguishable.
-            const overlays = [...document.querySelectorAll('body > .popup, body > .loader, body > #dialogs')]
+            const hiddenNow = () => [...document.querySelectorAll('#dialogs, body > .popup, body > .loader')]
                 .filter(element => element && getComputedStyle(element).display !== 'none'
                     && element.getBoundingClientRect().height > 0);
-            const overlayNames = overlays.map(element => element.id || element.className);
-            const overlayStyles = overlays.map(element => [element, element.style.visibility]);
-            for (const element of overlays) element.style.visibility = 'hidden';
-            const center = document.elementFromPoint(Math.round(window.innerWidth / 2), Math.round(window.innerHeight / 2));
-            const fallback = document.elementFromPoint(
-                Math.round((panelRect?.left ?? 0) + 8),
-                Math.round((panelRect?.top ?? 0) + 120),
-            );
-            for (const [element, visibility] of overlayStyles) element.style.visibility = visibility;
-            if (consentWasVisible) consent.style.visibility = '';
+            const blockers = [];
+            let center = null;
+            let fallback = null;
+            // SillyTavern may open its own modal at any moment (toasts, a dialog from
+            // an earlier probe). An open modal makes the page inert and every
+            // elementFromPoint returns HTML, so retry a few times hiding overlays;
+            // a genuinely zero-height panel still fails every attempt.
+            for (let attempt = 0; attempt < 3 && !(center && panel?.contains(center)) && !(fallback && panel?.contains(fallback)); attempt += 1) {
+                const roots = hiddenNow();
+                for (const name of roots.map(element => element.id || element.className)) {
+                    if (!blockers.includes(name)) blockers.push(name);
+                }
+                const styles = roots.map(element => [element, element.style.display]);
+                for (const element of roots) element.style.display = 'none';
+                const consentVisible = Boolean(consent && !consent.hidden
+                    && getComputedStyle(consent).display !== 'none'
+                    && consent.getBoundingClientRect().height > 0);
+                if (consentVisible) consent.style.visibility = 'hidden';
+                center = document.elementFromPoint(Math.round(window.innerWidth / 2), Math.round(window.innerHeight / 2));
+                fallback = document.elementFromPoint(
+                    Math.round((panelRect?.left ?? 0) + 8),
+                    Math.round((panelRect?.top ?? 0) + 120),
+                );
+                for (const [element, display] of styles) element.style.display = display;
+                if (consentVisible) consent.style.visibility = '';
+            }
+            const overlayNames = blockers;
             const insidePanel = Boolean(center && panel && panel.contains(center))
                 || Boolean(fallback && panel && panel.contains(fallback));
             const topAtCenter = center ? (center.id || center.className || center.tagName) : null;
@@ -2313,6 +2422,8 @@ async function main() {
         await runProbe('button layout', probeButtonLayout, cdp);
         await runProbe('panel sections', probePanelSections, cdp);
         await runProbe('identity and metadata', probeIdentityAndMetadata, cdp);
+        await runProbe('prompt injection', probePromptInjection, cdp);
+        await runProbe('native slot', probeNativeSlot, cdp);
         await runProbe('live reads', probeLiveReads, cdp);
         await runProbe('permission flow', probePermissionFlow, cdp);
         await runProbe('consent prompt', probeConsent, cdp);

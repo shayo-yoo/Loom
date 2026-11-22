@@ -97,6 +97,9 @@ Write capabilities (the read/write split required by Core requirements §5):
 | `worlds.entry.create` | `{ name, entry? }` | `{ name, uid, created }` | `host.worldinfo.write` |
 | `worlds.entry.remove` | `{ name, uid }` | `{ name, uid, removed }` | `host.worldinfo.write` |
 | `chat.append` | `{ text, type? }` | `{ appended, type, index }` | `host.chat.write` |
+| `prompt.set` | `{ text, position?, depth?, role?, key? }` | `{ key, position, depth, role, length }` | `host.prompt.inject` |
+| `prompt.clear` | `{ key }` or `{ all: true }` | `{ cleared: [key] }` | `host.prompt.inject` |
+| `prompt.list` | — | `[{ key, position, depth, role, length, preview }]` | `host.prompt.inject` |
 | `chat.edit` | `{ index, text }` | `{ index, previous, saved, rendered }` | `host.chat.write` |
 | `chat.delete` | `{ index, expect }` | `{ index, removed, remaining }` | `host.chat.write` |
 | `worlds.create` | `{ name }` | `{ name, created }` | `host.worldinfo.manage` |
@@ -183,6 +186,13 @@ Extensions can also register **composite components** — a named view tree reus
 - The composite mounts its tree as a nested view inside `.loom-composite`; `update` re-renders it and `unmount` destroys it, so no view is leaked when the parent tree changes or the extension unloads.
 - Another extension can use a composite by id. A composite serializes as its own id and props; its internal tree belongs to its definition, not the serialized view.
 
+Views can also be mounted **inside SillyTavern's own panels** instead of floating:
+
+- `LoomUI.slots` → `{ settings: '#extensions_settings', settings2: '#extensions_settings2', menu: '#extensionsMenu', leftNav: '#left-nav-panel' }`.
+- `mountToSlot(extensionId, slot, viewOptions)` appends a view into that container inside a `.loom-slot` wrapper and returns the view, or `null` when the container is not in the DOM yet (call again later).
+- `unmountFromSlot`, `listSlotMounts` complete the lifecycle; every mount is registered as an extension cleanup, so unloading an extension never leaves UI inside a host panel.
+- The slot list is an allowlist: an unknown slot throws with the known names, so an extension cannot target arbitrary host elements.
+
 ## Capability metadata
 
 Capability descriptors accept two optional fields beyond the schema and permissions:
@@ -220,6 +230,17 @@ On phones, SillyTavern renders with a transformed, zero-height root; Loom's fixe
 `importExtension(entryUrl, options)` merges `options.manifest` (a package's `manifest.json`) with the module's exported manifest: the explicit manifest wins field by field, but `activate`/`deactivate` come from code when the JSON manifest has none. A package therefore keeps identity in JSON and behaviour in code.
 
 Bundled packages load on every boot unless disabled; a missing `extensions/index.json` is not an error. Manually installed URLs and scripts are re-imported on the next boot; a failed import is shown in the panel with its error and keeps its record until removed.
+
+## Prompt injection (`host.prompt.inject`)
+
+Writing into the generation context is the most invasive family, so it has its **own** permission that no other capability declares: editing a world book does not imply shaping the prompt.
+
+- `prompt.set` stores the text with SillyTavern's `setExtensionPrompt`. Positions are mirrored from the host enum (`in_prompt` = 0, `in_chat` = 1, `before_prompt` = 2) and roles likewise (`system` = 0, `user` = 1, `assistant` = 2), because `getContext()` exposes the setter but not the enums. Defaults: `in_chat`, depth 4, `system`, key `default`. Text ≤ 20 000 chars, depth ≤ 10 000.
+- The caller's key is namespaced as `loom:<callerId>:<key>`, so extensions cannot collide with or clear each other, and `prompt.list` shows only the caller's own entries.
+- The write is **read back** from `context.extensionPrompts`; a host that drops it yields `PROMPT_INJECT_FAILED` instead of a false success.
+- The first write registers one Core cleanup for the caller, so unloading an extension removes every injection it made.
+- `prompt.clear` takes one `key` or `all: true`; clearing a missing key returns an empty `cleared` list rather than failing.
+- **Not supported:** mutating generation itself (`GENERATION_AFTER_COMMANDS`). Its options object is undocumented host internals; wrapping it would be a fragile contract. Observation remains available through `host:generation:started` / `host:generation:ended`.
 
 ## Built-in Host Events (`loom-host`)
 

@@ -1,5 +1,7 @@
 # Change Log
 
+- [CHG-20261122-042](history/recent/CHG-20261122-042.md): Native panel slots — `LoomUI.mountToSlot` renders into SillyTavern's own panels with cleanup (0.35.0).
+- [CHG-20261122-041](history/recent/CHG-20261122-041.md): Prompt injection — `prompt.set`/`clear`/`list` behind `host.prompt.inject`, caller-namespaced and removed on unregister (0.35.0).
 - [CHG-20261122-040](history/recent/CHG-20261122-040.md): Composite components — a named view tree registered as a reusable component (0.34.0).
 - [CHG-20261122-039](history/recent/CHG-20261122-039.md): Identity and contract gaps — package `author`, content hash over real package content, capability `errors`/`compatibility`, and a data-type registry (0.34.0).
 - [CHG-20261122-038](history/recent/CHG-20261122-038.md): Collapsible panel sections, package rescan, and in-place script editing (0.33.0).

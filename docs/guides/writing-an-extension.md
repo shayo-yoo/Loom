@@ -186,7 +186,43 @@ globalThis.LoomUI.registerCompositeComponent(id, {
 
 复合组件与普通组件共享身份、属性校验、事件与清理；它内部是一棵嵌套视图，`update` 时重建、`unmount` 时销毁。
 
-## 6. 脚本：一个文件就够了
+如果界面要放进酒馆自己的面板（而不是浮在页面上），用槽位：
+
+```js
+const view = globalThis.LoomUI.mountToSlot(id, 'settings', {
+    root: { component: 'text', props: { text: '我的设置' } },
+});
+// view 为 null 说明容器还没渲染出来，稍后再挂一次即可
+globalThis.LoomUI.unmountFromSlot(id, 'settings');
+```
+
+可用槽位：`settings`（扩展设置列）、`settings2`、`menu`（魔杖菜单）、`leftNav`。槽位是白名单，未知槽位会直接报错；卸载扩展时挂载的界面会被自动移除。
+
+## 6. 上下文注入
+
+如果扩展需要影响模型读到的内容，用注入能力（需要单独授权 `host.prompt.inject`）：
+
+```js
+await globalThis.Loom.executeCapability('loom-host', 'prompt.set', {
+    text: '保持角色设定，不要跳出。',
+    position: 'in_chat',   // in_prompt / in_chat / before_prompt
+    depth: 4,
+    role: 'system',        // system / user / assistant
+    key: 'main',
+}, { caller: id });
+
+await globalThis.Loom.executeCapability('loom-host', 'prompt.list', null, { caller: id });
+await globalThis.Loom.executeCapability('loom-host', 'prompt.clear', { all: true }, { caller: id });
+```
+
+要点：
+
+- 键会被命名空间化为 `loom:<你的 id>:<key>`，因此不会和其他扩展冲突，也看不到别人的注入；
+- 写入后会回读校验，宿主没存下来会得到 `PROMPT_INJECT_FAILED`；
+- 扩展卸载时它写入的所有注入会自动清除；
+- 目前**不支持**修改生成过程本身（`GENERATION_AFTER_COMMANDS`），只支持向上下文写入。
+
+## 7. 脚本：一个文件就够了
 
 不是每个小功能都值得建扩展目录。面板「脚本」区可以直接粘贴一个 ES 模块并运行：不需要 `manifest.json`、不需要目录、不需要跑索引。
 
@@ -210,7 +246,7 @@ export default {
 - 点 **编辑** 会把源码载入表单，保存时按「保存修改」更新原脚本；「重新运行」直接重跑当前源码。
 - 脚本不是沙箱：它是本地加载器，信任边界与扩展相同——不要用它运行来源不明的代码。
 
-## 7. 安装、启用与重载
+## 8. 安装、启用与重载
 
 1. 扩展：把目录放进 `extensions/<id>/`，运行 `npm run extensions:index`。
 2. 刷新酒馆页面，或在面板「安装与扩展」里点 **重新扫描**（不必刷新页面）；面板会列出它，状态 `active`。
@@ -219,7 +255,7 @@ export default {
 
 手动安装（不放进仓库）：在面板输入模块地址（相对 Loom 根目录或绝对 URL），安装记录会持久化，刷新后自动恢复。
 
-## 8. 调试
+## 9. 调试
 
 - 面板「扩展」列表显示每个扩展的状态与错误信息；
 - 「安装问题」区显示导入/脚本失败的原因；
@@ -228,7 +264,7 @@ export default {
 - 单元测试放在相邻的 `*.test.js`，`npm test` 无需浏览器；
 - 端到端验证用 `npm run verify:browser`（需要酒馆在 8100 运行），并可用 `Emulation` 模拟窄视口。**验证脚本只能修改自己创建的临时数据**。
 
-## 9. 完整例子
+## 10. 完整例子
 
 `extensions/hello-loom/` 是最小可用包；`extensions/world-book-manager/` 演示了权限申请、宿主读写、LoomUI 界面、分页/搜索与错误处理。两者的 `manifest.json` 与 `index.js` 都可以直接复制改写。
 
@@ -237,7 +273,7 @@ export default {
 - **读完整内容要用 `worlds.export`**：`worlds.entries` 为展示会把内容截断到 2000 字，拿截断内容回写会毁数据。
 - **`worlds.entry.update` 的 `uid` 是字符串**（`worlds.entry.create` 返回的也是字符串），传数字会得到 `INVALID_INPUT`。
 
-## 10. 常见错误
+## 11. 常见错误
 
 | 现象 | 原因 |
 |---|---|
