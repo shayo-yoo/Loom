@@ -246,7 +246,31 @@ export default {
 - 点 **编辑** 会把源码载入表单，保存时按「保存修改」更新原脚本；「重新运行」直接重跑当前源码。
 - 脚本不是沙箱：它是本地加载器，信任边界与扩展相同——不要用它运行来源不明的代码。
 
-## 8. 安装、启用与重载
+## 8. 第三方自注册扩展
+
+如果扩展不在 `extensions/` 下（例如由另一段代码在运行时注入），可以请求 Loom 登记：
+
+```js
+const { id, status } = globalThis.LoomUI.registerExternal({
+    id: 'my-tool',
+    name: '我的工具',
+    version: '1.0.0',
+    author: 'someone',
+    description: '一句话说明',
+    permissions: ['host.chat.read'],
+});
+// status === 'pending'：已弹出确认，用户允许后才会真正注册
+```
+
+流程与约定：
+
+- 首次请求是 `pending`：面板上方会弹出确认卡，列出 id、版本、作者、说明与**声明的权限**；
+- 允许后 Loom 以 `origin: 'external'` 注册它，声明的权限再走正常的授权流程；
+- 拒绝会记住，重复请求会直接报错；面板提供「改判允许 / 清除记录」；
+- 决定会被持久化，刷新后不会重复询问，启动时只恢复已允许的记录；
+- 这是**协作式确认，不是沙箱**：绕过本接口直接调用全局运行时不会被阻止。它的价值是让用户知道"有第三方代码要进来"。
+
+## 9. 安装、启用与重载
 
 1. 扩展：把目录放进 `extensions/<id>/`，运行 `npm run extensions:index`。
 2. 刷新酒馆页面，或在面板「安装与扩展」里点 **重新扫描**（不必刷新页面）；面板会列出它，状态 `active`。
@@ -255,7 +279,7 @@ export default {
 
 手动安装（不放进仓库）：在面板输入模块地址（相对 Loom 根目录或绝对 URL），安装记录会持久化，刷新后自动恢复。
 
-## 9. 调试
+## 10. 调试
 
 - 面板「扩展」列表显示每个扩展的状态与错误信息；
 - 「安装问题」区显示导入/脚本失败的原因；
@@ -264,7 +288,7 @@ export default {
 - 单元测试放在相邻的 `*.test.js`，`npm test` 无需浏览器；
 - 端到端验证用 `npm run verify:browser`（需要酒馆在 8100 运行），并可用 `Emulation` 模拟窄视口。**验证脚本只能修改自己创建的临时数据**。
 
-## 10. 完整例子
+## 11. 完整例子
 
 `extensions/hello-loom/` 是最小可用包；`extensions/world-book-manager/` 演示了权限申请、宿主读写、LoomUI 界面、分页/搜索与错误处理。两者的 `manifest.json` 与 `index.js` 都可以直接复制改写。
 
@@ -273,7 +297,7 @@ export default {
 - **读完整内容要用 `worlds.export`**：`worlds.entries` 为展示会把内容截断到 2000 字，拿截断内容回写会毁数据。
 - **`worlds.entry.update` 的 `uid` 是字符串**（`worlds.entry.create` 返回的也是字符串），传数字会得到 `INVALID_INPUT`。
 
-## 11. 常见错误
+## 12. 常见错误
 
 | 现象 | 原因 |
 |---|---|

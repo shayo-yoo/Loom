@@ -24,6 +24,34 @@
     justify-content: center;
 }
 
+/* External (self-registering) extension consent and rows. */
+.loom_external {
+    position: fixed;
+    z-index: 10001;
+    top: 12px;
+    right: 12px;
+    max-width: min(420px, calc(100vw - 24px));
+    max-height: 60vh;
+    overflow: auto;
+}
+
+.loom_external[hidden] {
+    display: none;
+}
+
+.loom_external_consent .loom_external_item {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0;
+    border-top: 1px solid var(--SmartThemeBorderColor, #555);
+}
+
+.loom_external_consent .loom_external_item:first-of-type {
+    border-top: 0;
+}
+
 /* A view mounted into a native SillyTavern panel slot. */
 .loom-slot {
     display: block;

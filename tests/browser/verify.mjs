@@ -393,8 +393,10 @@ async function probePermissionFlow(cdp) {
     // After a grant the gated capability actually runs.
     await cdp.evaluate("window.Loom.grantPermission('verify-probe', 'host.chat.read'); return true;");
     const allowed = await cdp.evaluate("return await window.Loom.executeCapability('loom-host', 'chat.messages', { limit: 3 }, { caller: 'verify-probe' });");
-    assertThat('chat.messages runs once granted', allowed.success === true && Array.isArray(allowed.data),
-        allowed.success ? `${allowed.data.length} messages` : allowed.error?.code);
+    assertThat('chat.messages runs once granted',
+        allowed.success === true && Array.isArray(allowed.data?.messages)
+        && allowed.data.messages.length <= 3,
+        allowed.success ? `${allowed.data.total} messages, page ${allowed.data.messages.length}` : allowed.error?.code);
 
     // Missing world is a real write path probe that cannot mutate user data.
     await cdp.evaluate("window.Loom.grantPermission('verify-probe', 'host.worldinfo.write'); return true;");
@@ -1863,6 +1865,78 @@ async function probeNativeSlot(cdp) {
         JSON.stringify(unknown));
 }
 
+async function probeExternalExtensions(cdp) {
+    await cdp.waitFor("return window.LoomUI?.isReady?.() === true;", SETTLE_TIMEOUT_MS, 'installer ready before external');
+    // Clear leftovers from an interrupted run so the probe starts from "unknown".
+    await cdp.evaluate(`for (const row of window.LoomUI.listExternalExtensions()) window.LoomUI.removeExternal(row.id);`);
+
+    const requested = await cdp.evaluate(`const Loom = window.Loom;
+        const result = window.LoomUI.registerExternal({
+            id: 'verify-external',
+            name: 'External Probe',
+            version: '2.0.0',
+            author: 'third-party',
+            description: 'self-registered',
+            permissions: ['host.chat.read'],
+        });
+        return {
+            result,
+            registered: Loom.listExtensions().some(entry => entry.id === 'verify-external'),
+            listed: window.LoomUI.listExternalExtensions(),
+            promptVisible: !document.getElementById('loom_external_consent')?.hidden,
+        };`);
+    assertThat('an external registration waits for the user',
+        requested.result?.status === 'pending' && requested.registered === false
+        && requested.promptVisible === true
+        && requested.listed?.[0]?.status === 'pending',
+        JSON.stringify(requested));
+
+    const approved = await cdp.evaluate(`const Loom = window.Loom;
+        const button = document.querySelector('#loom_external_consent [data-external-approve="verify-external"]');
+        button?.click();
+        await new Promise(resolve => setTimeout(resolve, 300));
+        return {
+            wasFound: Boolean(button),
+            registered: Loom.listExtensions().some(entry => entry.id === 'verify-external'),
+            origin: Loom.listExtensions().find(entry => entry.id === 'verify-external')?.origin ?? null,
+            status: window.LoomUI.listExternalExtensions()[0]?.status ?? null,
+            pendingPermission: Loom.listPermissionRequests().some(entry => entry.extensionId === 'verify-external'),
+            promptHidden: document.getElementById('loom_external_consent')?.hidden ?? null,
+        };`);
+    assertThat('approving registers the external extension and asks for its permissions',
+        approved.wasFound === true && approved.registered === true && approved.origin === 'external'
+        && approved.status === 'approved' && approved.pendingPermission === true && approved.promptHidden === true,
+        JSON.stringify(approved));
+
+    // A denied extension must never be registered, and the decision must stick.
+    const denied = await cdp.evaluate(`const Loom = window.Loom;
+        window.LoomUI.removeExternal('verify-external');
+        window.LoomUI.registerExternal({ id: 'verify-external', name: 'External Probe', permissions: [] });
+        const button = document.querySelector('#loom_external_consent [data-external-deny="verify-external"]');
+        button?.click();
+        await new Promise(resolve => setTimeout(resolve, 300));
+        const deniedStatus = window.LoomUI.listExternalExtensions()[0]?.status ?? null;
+        let threw = false;
+        try { window.LoomUI.registerExternal({ id: 'verify-external', name: 'Again' }); } catch { threw = true; }
+        return {
+            wasFound: Boolean(button),
+            status: deniedStatus,
+            registered: Loom.listExtensions().some(entry => entry.id === 'verify-external'),
+            threw,
+        };`);
+    assertThat('denying keeps the extension out and blocks a re-request',
+        denied.wasFound === true && denied.status === 'denied' && denied.registered === false && denied.threw === true,
+        JSON.stringify(denied));
+
+    const cleaned = await cdp.evaluate(`window.LoomUI.removeExternal('verify-external');
+        return {
+            listed: window.LoomUI.listExternalExtensions().length,
+            registered: window.Loom.listExtensions().some(entry => entry.id === 'verify-external'),
+        };`);
+    assertThat('clearing the record forgets the external extension',
+        cleaned.listed === 0 && cleaned.registered === false, JSON.stringify(cleaned));
+}
+
 async function probeWorldRename(cdp) {
     await cdp.evaluate(`const Loom = window.Loom;
         if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) Loom.loadExtension({ id: 'verify-probe', name: 'Verify Probe' });
@@ -2212,9 +2286,10 @@ async function probeMobileLayout(cdp) {
             // (pending requests are common during a full run). Hide it for the
             // hit-test only — the question is whether the panel itself is visible.
             const consent = document.getElementById('loom_consent');
-            const hiddenNow = () => [...document.querySelectorAll('#dialogs, body > .popup, body > .loader')]
-                .filter(element => element && getComputedStyle(element).display !== 'none'
-                    && element.getBoundingClientRect().height > 0);
+            const hiddenNow = () => [...document.querySelectorAll(
+                '#dialogs, body > .popup, body > .loader, [class*="dialogue_popup"], .popup',
+            )].filter(element => element && getComputedStyle(element).display !== 'none'
+                && element.getBoundingClientRect().height > 0);
             const blockers = [];
             let center = null;
             let fallback = null;
@@ -2424,6 +2499,7 @@ async function main() {
         await runProbe('identity and metadata', probeIdentityAndMetadata, cdp);
         await runProbe('prompt injection', probePromptInjection, cdp);
         await runProbe('native slot', probeNativeSlot, cdp);
+        await runProbe('external extensions', probeExternalExtensions, cdp);
         await runProbe('live reads', probeLiveReads, cdp);
         await runProbe('permission flow', probePermissionFlow, cdp);
         await runProbe('consent prompt', probeConsent, cdp);

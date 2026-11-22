@@ -21,6 +21,14 @@ import {
 import { serializeNode } from './view-tree.js';
 import { registerCompositeComponent } from './composite.js';
 import { SLOTS, listSlotMounts, mountToSlot, unmountFromSlot } from './slots.js';
+import {
+    describeExternal,
+    findExternal,
+    forgetExternal,
+    normalizeExternalManifest,
+    rememberExternal,
+    setExternalStatus,
+} from './external.js';
 import { escapeHtml } from './dom.js';
 import { SETTINGS_ENTRY_ID, buildSettingsEntryHtml, summarizeForSettings } from './settings.js';
 import {
@@ -79,6 +87,9 @@ const DISABLED_STATE_KEY = 'disabledExtensions';
 const SCRIPTS_STATE_KEY = 'scripts';
 const LOOM_ROOT = new URL('../', import.meta.url);
 const SECTION_STATE_KEY = 'panelSections';
+const EXTERNAL_STATE_KEY = 'externalExtensions';
+const EXTERNAL_SECTION_ID = 'loom_external';
+const EXTERNAL_CONSENT_ID = 'loom_external_consent';
 const SECTION_DEFAULTS = Object.freeze({ installer: true, scripts: true });
 const bundledSources = [];
 const installProblems = [];
@@ -87,6 +98,7 @@ let disabledIds = [];
 let scripts = [];
 let sectionState = {};
 let editingScriptId = null;
+let externalRecords = [];
 
 function ensureExtension() {
     if (!runtime?.registerExtension || runtime.listExtensions().some(extension => extension.id === EXTENSION_ID)) {
@@ -267,6 +279,8 @@ async function bootExtensions() {
     renderInstaller();
     renderScripts();
     renderExtensionStates();
+    renderExternalConsent();
+    renderExternalSection();
 }
 
 /** Enable or disable an installed package without touching its files. */
@@ -282,9 +296,11 @@ async function setExtensionEnabled(identity, enabled) {
         persistDisabledIds([...disabledIds, source.id ?? identity]);
     } else {
         persistDisabledIds(disabledIds.filter(id => id !== (source.id ?? identity)));
-        // Re-importing an extension that is already registered would fail with
-        // "already loaded"; enabling is a no-op in that case.
-        if (state?.state !== 'active') await importSource(source);
+        // Enabling must work whether the extension is unregistered, inactive, or
+        // failed: unload first (idempotent) so a stale loader record cannot make
+        // the re-import fail with "already loaded", then import from the source.
+        if (source.id) runtime?.unloadExtension?.(source.id);
+        await importSource(source);
     }
     renderInstaller();
     renderExtensionStates();
@@ -324,7 +340,7 @@ async function rescanExtensions() {
     installedEntries = readInstalledEntries();
     disabledIds = readDisabledIds();
     scripts = readScripts();
-
+    externalRecords = readExternalRecords();
     const index = await loadBundledIndex();
     bundledSources.length = 0;
     bundledSources.push(...index.sources);
@@ -654,6 +670,56 @@ function mountInstallerSection() {
     });
 }
 
+function mountExternalSection() {
+    if (document.getElementById(EXTERNAL_SECTION_ID)) return;
+    const content = document.querySelector(`#${PANEL_ID} .loom_panel_content`);
+    if (!content) return;
+
+    const section = document.createElement('details');
+    section.className = 'loom_section';
+    section.dataset.section = 'external';
+    section.id = EXTERNAL_SECTION_ID;
+    section.innerHTML = `
+        <h3>第三方扩展</h3>
+        <p class="loom_hint">运行时自行注册的扩展（不在 extensions 索引里）。首次出现需要用户确认；确认结果会被记住。</p>
+        <div id="${EXTERNAL_SECTION_ID}_list"></div>
+    `;
+    wrapMountedSection(section, '第三方扩展');
+    content.append(section);
+
+    section.addEventListener('click', event => {
+        const approve = event.target.closest('[data-external-approve]');
+        const remove = event.target.closest('[data-external-remove]');
+        try {
+            if (approve) approveExternal(approve.dataset.externalApprove);
+            else if (remove) removeExternal(remove.dataset.externalRemove);
+        } catch (error) {
+            installProblems.push(error instanceof Error ? error.message : String(error));
+            renderExternalSection();
+        }
+    });
+}
+
+function mountExternalConsent() {
+    if (document.getElementById(EXTERNAL_CONSENT_ID)) return;
+    const container = document.createElement('div');
+    container.id = EXTERNAL_CONSENT_ID;
+    container.className = 'loom_external';
+    container.hidden = true;
+    document.body.append(container);
+    container.addEventListener('click', event => {
+        const approve = event.target.closest('[data-external-approve]');
+        const deny = event.target.closest('[data-external-deny]');
+        try {
+            if (approve) approveExternal(approve.dataset.externalApprove);
+            else if (deny) denyExternal(deny.dataset.externalDeny);
+        } catch (error) {
+            installProblems.push(error instanceof Error ? error.message : String(error));
+            renderExternalConsent();
+        }
+    });
+}
+
 function mountScriptSection() {
     if (document.getElementById(SCRIPT_SECTION_ID)) return;
     const content = document.querySelector(`#${PANEL_ID} .loom_panel_content`);
@@ -780,6 +846,11 @@ function installUiApi() {
             maybeSlot === undefined ? unmountFromSlot(EXTENSION_ID, extensionIdOrSlot) : unmountFromSlot(extensionIdOrSlot, maybeSlot)
         ),
         listSlotMounts: (extensionId) => listSlotMounts(extensionId),
+        registerExternal: (manifest) => registerExternal(manifest),
+        approveExternal: (id) => approveExternal(id),
+        denyExternal: (id) => denyExternal(id),
+        removeExternal: (id) => removeExternal(id),
+        listExternalExtensions: () => describeExternal(externalRecords, runtime.listExtensionStates()),
         createView: (extensionIdOrOptions, maybeOptions) => (
             typeof extensionIdOrOptions === 'string'
                 ? createView(extensionIdOrOptions, maybeOptions)
@@ -1002,8 +1073,146 @@ function renderConsent() {
     }
 }
 
-function togglePermission(button) {
-    const permission = button.dataset.permission;
+/**
+ * External (self-registering) extension consent.
+ *
+ * A third party calls `LoomUI.registerExternal(manifest)`; until the user approves
+ * the record nothing is registered. The prompt lives in the same container the
+ * permission consent uses, below it, so a user answers both in one place.
+ */
+function readExternalRecords() {
+    const stored = runtime?.getState?.(EXTENSION_ID, EXTERNAL_STATE_KEY);
+    return Array.isArray(stored) ? stored.filter(record => record && typeof record.id === 'string') : [];
+}
+
+function persistExternalRecords(list) {
+    externalRecords = list;
+    runtime?.setState?.(EXTENSION_ID, EXTERNAL_STATE_KEY, list);
+}
+
+function renderExternalConsent() {
+    const container = document.getElementById(EXTERNAL_CONSENT_ID);
+    if (!container) return;
+    const pending = externalRecords.filter(record => record.status === 'pending');
+    if (pending.length === 0) {
+        container.hidden = true;
+        container.replaceChildren();
+        return;
+    }
+
+    container.hidden = false;
+    container.innerHTML = `
+        <div class="loom-card loom_external_consent">
+            <strong>第三方扩展请求注册</strong>
+            <p class="loom_hint">这些代码不在 Loom 的扩展索引中，是运行时自行注册的。批准后才会生效，选择会被记住。</p>
+            ${pending.map(record => `
+                <div class="loom_external_item" data-external="${escapeHtml(record.id)}">
+                    <div class="loom_install_main">
+                        <strong>${escapeHtml(record.name)}</strong>
+                        <span class="loom_hint">${escapeHtml(record.id)} · v${escapeHtml(record.version)}${record.author ? ` · ${escapeHtml(record.author)}` : ''}</span>
+                        ${record.description ? `<span class="loom_hint">${escapeHtml(record.description)}</span>` : ''}
+                        <span class="loom_hint">权限：${record.permissions.length ? escapeHtml(record.permissions.join('、')) : '无'}</span>
+                    </div>
+                    <button type="button" class="menu_button" data-external-approve="${escapeHtml(record.id)}">允许</button>
+                    <button type="button" class="menu_button" data-external-deny="${escapeHtml(record.id)}">拒绝</button>
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+/**
+ * Request registration of an external extension.
+ *
+ * Returns `{ id, status }`. `pending` means the user must answer; `approved`
+ * means the record was already approved and the caller may register now.
+ */
+function registerExternal(manifest) {
+    const normalized = normalizeExternalManifest(manifest);
+    const existing = findExternal(externalRecords, normalized.id);
+    if (existing?.status === 'denied') {
+        throw new Error(`外部扩展 ${normalized.id} 已被拒绝；先在面板中清除记录再重试。`);
+    }
+    persistExternalRecords(rememberExternal(externalRecords, normalized));
+    const record = findExternal(externalRecords, normalized.id);
+    renderExternalConsent();
+    renderExternalSection();
+    return { id: normalized.id, status: record.status };
+}
+
+/** Approve a pending record and register it with Core. */
+function approveExternal(id) {
+    const record = findExternal(externalRecords, id);
+    if (!record) throw new Error(`未找到外部扩展：${id}`);
+    persistExternalRecords(setExternalStatus(externalRecords, id, 'approved'));
+    if (!runtime.listExtensions().some(entry => entry.id === id)) {
+        runtime.registerExtension({
+            id: record.id,
+            name: record.name,
+            version: record.version,
+            author: record.author || undefined,
+            description: record.description,
+            origin: 'external',
+        });
+    }
+    for (const permission of record.permissions) {
+        try {
+            runtime.requestPermission(id, permission, { reason: `第三方扩展 ${record.name} 声明了该权限` });
+        } catch {
+            // A permission request must never block approval.
+        }
+    }
+    renderExternalConsent();
+    renderExternalSection();
+    renderExtensionStates();
+    return true;
+}
+
+function denyExternal(id) {
+    if (!findExternal(externalRecords, id)) throw new Error(`未找到外部扩展：${id}`);
+    persistExternalRecords(setExternalStatus(externalRecords, id, 'denied'));
+    if (runtime.listExtensions().some(entry => entry.id === id)) runtime.unregisterExtension(id);
+    renderExternalConsent();
+    renderExternalSection();
+    return true;
+}
+
+/** Forget a record entirely (the extension will have to ask again). */
+function removeExternal(id) {
+    if (runtime.listExtensions().some(entry => entry.id === id)) runtime.unregisterExtension(id);
+    persistExternalRecords(forgetExternal(externalRecords, id));
+    renderExternalConsent();
+    renderExternalSection();
+    return true;
+}
+
+function renderExternalSection() {
+    const list = document.getElementById(`${EXTERNAL_SECTION_ID}_list`);
+    if (!list) return;
+    const rows = describeExternal(externalRecords, runtime.listExtensionStates());
+    list.innerHTML = rows.length === 0
+        ? '<p class="loom_hint">没有第三方自注册扩展。扩展可以通过 LoomUI.registerExternal 请求注册。</p>'
+        : rows.map(row => {
+            const statusLabel = { pending: '待确认', approved: '已允许', denied: '已拒绝' }[row.status] ?? row.status;
+            const detail = [
+                `v${row.version}`, statusLabel, row.registered ? '运行中' : '未运行',
+                row.permissions.length ? `权限：${row.permissions.join('、')}` : '',
+            ].filter(Boolean).join(' · ');
+            return `
+                <div class="loom_install_row">
+                    <div class="loom_install_main">
+                        <strong>${escapeHtml(row.name)}</strong>
+                        <span class="loom_hint">${escapeHtml(row.id)}${row.author ? ` · ${escapeHtml(row.author)}` : ''}</span>
+                        <span class="loom_hint">${escapeHtml(detail)}</span>
+                        ${row.error ? `<span class="loom_install_error">${escapeHtml(row.error)}</span>` : ''}
+                    </div>
+                    ${row.status === 'denied' ? `<button type="button" class="menu_button" data-external-approve="${escapeHtml(row.id)}">改判允许</button>` : ''}
+                    <button type="button" class="menu_button" data-external-remove="${escapeHtml(row.id)}">清除记录</button>
+                </div>`;
+        }).join('');
+}
+
+function togglePermission(button) {    const permission = button.dataset.permission;
     const extensionId = button.dataset.extension;
     if (!permission || !extensionId || !runtime) return;
 
@@ -1116,6 +1325,8 @@ function renderPanel() {
     renderPermissions();
     renderExtensionStates();
     renderInstaller();
+    renderExternalSection();
+    renderExternalConsent();
     renderUiSummary();
     renderIdentityConflicts();
     updateSettingsEntry();
@@ -1256,6 +1467,8 @@ function installPanel() {
     document.body.append(panel);
     mountInstallerSection();
     mountScriptSection();
+    mountExternalSection();
+    mountExternalConsent();
     applySectionState();
     document.getElementById('loom_close').addEventListener('click', closePanel);
     document.getElementById('loom_refresh').addEventListener('click', renderPanel);

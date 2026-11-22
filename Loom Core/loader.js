@@ -184,6 +184,7 @@ export function createExtensionLoader(core) {
             id: normalized.id,
             name: normalized.name,
             version: normalized.version,
+            origin: 'managed',
             ...normalized.metadata,
         });
 

@@ -3,7 +3,7 @@ import { createExtensionLoader } from './loader.js';
 const EXTENSION_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/i;
 const PERMISSION_PATTERN = /^[a-z0-9][a-z0-9._:-]*$/i;
 const EVENT_NAME_PATTERN = /^[a-z0-9][a-z0-9:._-]*$/i;
-const LOOM_VERSION = '0.35.0';
+const LOOM_VERSION = '0.36.0';
 const capabilityRegistry = new Map();
 const extensionRegistry = new Map();
 const eventListeners = new Map();
@@ -120,8 +120,18 @@ export function computeContentHash(content) {
     return `fnv1a64:${hash.toString(16).padStart(16, '0')}`;
 }
 
-function normalizeIdentityPart(value, kind, fallback) {
-    if (value === undefined) return fallback;
+const EXTENSION_ORIGINS = Object.freeze(['managed', 'external', 'direct']);
+
+/** Registration origin; unknown values are rejected rather than silently coerced. */
+function normalizeOrigin(origin) {
+    if (origin === undefined) return 'direct';
+    if (typeof origin !== 'string' || !EXTENSION_ORIGINS.includes(origin)) {
+        throw new TypeError(`Extension origin must be one of: ${EXTENSION_ORIGINS.join(', ')}`);
+    }
+    return origin;
+}
+
+function normalizeIdentityPart(value, kind, fallback) {    if (value === undefined) return fallback;
     if (typeof value !== 'string' || !EXTENSION_ID_PATTERN.test(value)) {
         throw new TypeError(`${kind} must contain only letters, numbers, dot, underscore, or hyphen.`);
     }
@@ -335,6 +345,11 @@ export function registerExtension(extension) {
         declaredId: identity.declaredId,
         identityKey: identity.key,
         contentHash,
+        // Where the registration came from. `managed` = a package loaded through the
+        // loader, `external` = a third party that registered itself, `direct` =
+        // bootstrap code (the host adapter and Loom UI). Surfaced so a UI can ask the
+        // user about external code instead of treating every extension alike.
+        origin: normalizeOrigin(extension.origin),
     });
     extensionRegistry.set(record.id, record);
     // Grants persisted before this extension registered are applied now, so the

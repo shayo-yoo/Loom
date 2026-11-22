@@ -76,7 +76,7 @@ Read capabilities (input `null` unless stated):
 - `characters.get` (`{ name }`, matched against name or avatar filename, case-insensitive): returns `{ name, avatar, description, personality, scenario, firstMessage, exampleMessages, creatorNotes, tags }`, or `null` when absent.
 - `worlds.list`: returns `[string]` world-info names.
 - `worlds.entries` (`{ name, limit?, offset?, query? }`, limit 1–200 default 200, offset ≥ 0 default 0, query ≤ 200 chars): loads the world book through `getContext().loadWorldInfo()` and returns `{ name, total, offset, limit, hasMore, entries }`, where `entries` is `[{ uid, comment, keys, secondaryKeys, content, enabled, constant, selective, order, truncated }]` sorted by `order` then `uid`. `query` is a case-insensitive substring over comment, keys, secondary keys and the visible content; `total` is the number of matches (not the page size), so a caller can page or report a count. Missing books and books without entries return `total: 0` with an empty page; a host without `loadWorldInfo` fails with `HOST_UNSUPPORTED`. Entry `content` is truncated at 2000 chars with `truncated: true` — read `worlds.export` when the full text is needed for editing. **Breaking change in 0.30.0:** the output used to be the bare array; it is now the page object (the empty result used to be `[]`).
-- `chat.messages` (`{ limit?, offset? }` or `null`; limit 1–100 default 20, offset counts back from the newest message): returns `[{ index, name, isUser, isSystem, text, truncated }]` in reading order (oldest first); `index` is the absolute chat position and `text` is truncated at 2000 chars. **Requires `host.chat.read`** — chat content is the user's private conversation, so it is the one gated read.
+- `chat.messages` (`{ limit?, offset?, query?, order? }` or `null`; limit 1–200 default 20, offset is an **absolute start index** default 0, query ≤ 200 chars, order `oldest`|`newest`): returns `{ total, offset, limit, hasMore, messages }`, where `messages` is `[{ index, name, isUser, isSystem, text, truncated }]`. `total` counts matches (the whole chat when no query), `index` is the absolute chat position, and `text` is truncated at 2000 chars. `order: 'newest'` reverses traversal while keeping absolute indexes. **Requires `host.chat.read`** — chat content is the user's private conversation, so it is the one gated read. **Breaking change in 0.36.0:** the output used to be a bare array and `offset` counted backwards from the newest message.
 - `viewport.get`: returns `{ width, height, pixelRatio, isMobile }`; `isMobile` uses `matchMedia('(max-width: 768px)')` with a width fallback.
 
 Caller-scoped settings capabilities read and write the caller's own namespace inside SillyTavern's persisted `extensionSettings`, keyed by the caller's Loom extension id:
@@ -216,6 +216,17 @@ A Loom extension package is a directory `extensions/<id>/` with `manifest.json` 
 - `isReady()` → whether boot finished loading the index, packages and scripts.
 - `getInstallProblems()` → the messages collected from failed imports and script runs.
 - `rescanExtensions()` → re-reads `extensions/index.json`, imports new or inactive packages (skipping disabled ones), and returns the known ids. The installer section has a 重新扫描 button for this.
+
+## External (self-registering) extensions
+
+A third party that is not in the package index can ask to register itself, with the user's confirmation:
+
+- `registerExternal({ id, name, version?, author?, description?, permissions? })` → `{ id, status }`. The first call creates a **pending** record and shows a prompt listing the id, version, author, description and declared permissions; nothing is registered yet. `status: 'denied'` throws instead of re-prompting.
+- `approveExternal(id)` → marks the record approved and registers it with Core using `origin: 'external'`; its declared permissions then go through the normal permission requests. `denyExternal(id)` unregisters and marks it denied. `removeExternal(id)` forgets the record so it will ask again.
+- `listExternalExtensions()` → rows joined with the live state (`{ id, name, version, author, description, permissions, status, registered, error }`); `registered` is true only when the extension is actually active.
+- The decision is persisted in `loom-ui` state (`externalExtensions`), so a reload does not re-prompt and boot only re-registers approved records.
+- Every registration carries `origin`: `managed` (loader), `external` (this flow), or `direct` (bootstrap code). Unknown values are rejected.
+- **Cooperative gate, not a sandbox:** code that bypasses this flow and calls the global runtime directly is not stopped. The gate provides consent UX and visibility, which matches Loom's stated boundary.
 
 Scripts are the lightweight package form:
 
