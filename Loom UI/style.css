@@ -24,6 +24,12 @@
     justify-content: center;
 }
 
+/* Composite components are a named nested view; they stack like a block. */
+.loom-composite {
+    display: block;
+    min-width: 0;
+}
+
 /* Collapsible panel sections */
 .loom_section {
     margin: 8px 0;

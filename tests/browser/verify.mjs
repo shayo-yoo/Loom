@@ -1717,6 +1717,53 @@ async function probePanelSections(cdp) {
     }`);
 }
 
+async function probeIdentityAndMetadata(cdp) {
+    // Package identity: author + id + content hash from the generated index.
+    const identity = await cdp.evaluate(`const entry = window.Loom.listExtensions().find(item => item.id === 'hello-loom');
+        return entry ? { author: entry.author, identityKey: entry.identityKey, contentHash: entry.contentHash } : null;`);
+    assertThat('a bundled package registers author, identity and content hash',
+        identity?.author === 'loom' && identity.identityKey === 'loom:hello-loom'
+        && /^fnv1a64:[0-9a-f]{16}$/.test(identity.contentHash ?? ''),
+        JSON.stringify(identity));
+
+    const metadata = await cdp.evaluate(`const Loom = window.Loom;
+        if (Loom.listExtensions().some(entry => entry.id === 'verify-metadata')) Loom.unregisterExtension('verify-metadata');
+        Loom.registerExtension({ id: 'verify-metadata', name: 'Verify Metadata' });
+        const capability = Loom.registerCapability('verify-metadata', {
+            id: 'verify.declared',
+            name: 'Declared errors',
+            errors: [{ code: 'PERMISSION_DENIED', description: 'needs a grant' }],
+            compatibility: { since: '0.34.0', deprecated: false, notes: 'probe' },
+            execute: () => null,
+        });
+        const listed = Loom.listCapabilities('verify-metadata').find(item => item.id === 'verify.declared');
+        const type = Loom.registerType('verify-metadata', {
+            id: 'verify.note',
+            name: 'Verify note',
+            schema: { type: 'object', required: ['text'], properties: { text: { type: 'string' } } },
+        });
+        const typeGet = Loom.getType('verify-metadata', 'verify.note');
+        const typeCount = Loom.getRuntimeInfo().typeCount;
+        Loom.unregisterExtension('verify-metadata');
+        return {
+            capability,
+            listed: { errors: listed?.errors, compatibility: listed?.compatibility },
+            type,
+            typeGet,
+            typeCount,
+            removed: Loom.getType('verify-metadata', 'verify.note'),
+        };`);
+    assertThat('a capability can declare error codes and compatibility',
+        metadata.listed.errors?.[0]?.code === 'PERMISSION_DENIED'
+        && metadata.listed.compatibility?.since === '0.34.0',
+        JSON.stringify(metadata));
+    assertThat('a data type registers with a stable identity and is removed with its owner',
+        metadata.typeGet?.extensionId === 'verify-metadata' && metadata.typeGet?.id === 'verify.note'
+        && metadata.typeGet?.schema?.required?.[0] === 'text' && metadata.typeCount >= 1
+        && metadata.removed === null,
+        JSON.stringify(metadata));
+}
+
 async function probeWorldRename(cdp) {
     await cdp.evaluate(`const Loom = window.Loom;
         if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) Loom.loadExtension({ id: 'verify-probe', name: 'Verify Probe' });
@@ -2265,6 +2312,7 @@ async function main() {
         await runProbe('panel', probePanel, cdp);
         await runProbe('button layout', probeButtonLayout, cdp);
         await runProbe('panel sections', probePanelSections, cdp);
+        await runProbe('identity and metadata', probeIdentityAndMetadata, cdp);
         await runProbe('live reads', probeLiveReads, cdp);
         await runProbe('permission flow', probePermissionFlow, cdp);
         await runProbe('consent prompt', probeConsent, cdp);

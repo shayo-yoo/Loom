@@ -59,9 +59,11 @@ export function normalizeIndex(payload, baseUrl) {
             id,
             name: typeof raw.name === 'string' && raw.name.trim() !== '' ? raw.name : id,
             version: typeof raw.version === 'string' ? raw.version : '',
+            author: typeof raw.author === 'string' ? raw.author : null,
             description: typeof raw.description === 'string' ? raw.description : '',
             manifest: typeof raw.manifest === 'string' ? resolveEntryUrl(raw.manifest, baseUrl) ?? raw.manifest : '',
             entry: url,
+            contentHash: typeof raw.contentHash === 'string' ? raw.contentHash : null,
             bundled: true,
         });
     }
@@ -121,6 +123,7 @@ export function describeInstalled(installed, states) {
             // is gone and falling back to the id would rename the row.
             name: entry.name ?? state?.name ?? entry.id ?? entry.entry,
             version: entry.version ?? state?.version ?? '',
+            author: entry.author ?? state?.author ?? '',
             permissions: Array.isArray(entry.permissions) ? entry.permissions : [],
             dependencies: Array.isArray(entry.dependencies) ? entry.dependencies : [],
             error: state?.error?.message ?? '',

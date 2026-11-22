@@ -11,6 +11,7 @@ import {
     executeCapability,
     getRuntimeInfo,
     getState,
+    getType,
     grantPermission,
     listCapabilities,
     listEvents,
@@ -20,8 +21,10 @@ import {
     listPermissionRequests,
     listPermissions,
     listStateKeys,
+    listTypes,
     registerCapability,
     registerExtension,
+    registerType,
     requestPermission,
     resolvePermissionRequest,
     revokePermission,
@@ -64,6 +67,80 @@ function setupExtension() {
         execute: async input => input,
     });
 }
+
+test('capabilities can declare their error codes and compatibility metadata', () => {
+    registerExtension({ id: extensionId, name: 'Test Suite' });
+    const registered = registerCapability(extensionId, {
+        id: 'declared',
+        name: 'Declared errors',
+        errors: [
+            { code: 'PERMISSION_DENIED', description: 'caller lacks a grant' },
+            { code: 'NOT_FOUND' },
+        ],
+        compatibility: { since: '0.34.0', deprecated: false, notes: 'stable' },
+        execute: () => null,
+    });
+
+    assert.deepEqual(registered.errors, [
+        { code: 'PERMISSION_DENIED', description: 'caller lacks a grant' },
+        { code: 'NOT_FOUND', description: '' },
+    ]);
+    assert.deepEqual(registered.compatibility, { since: '0.34.0', deprecated: false, notes: 'stable' });
+
+    const listed = listCapabilities(extensionId).find(capability => capability.id === 'declared');
+    assert.deepEqual(listed.errors, registered.errors, 'the snapshot keeps the declarations');
+    assert.deepEqual(listed.compatibility, registered.compatibility);
+
+    registerCapability(extensionId, { id: 'defaults', name: 'Defaults', execute: () => null });
+    const plain = listCapabilities(extensionId).find(capability => capability.id === 'defaults');
+    assert.deepEqual(plain.errors, []);
+    assert.equal(plain.compatibility, null);
+});
+
+test('capability metadata is validated', () => {
+    registerExtension({ id: extensionId, name: 'Test Suite' });
+    const cases = [
+        { errors: 'nope' },
+        { errors: [{ code: 'lowercase' }] },
+        { errors: [null] },
+        { compatibility: 'v1' },
+        { compatibility: { unknown: true } },
+        { compatibility: { deprecated: 'yes' } },
+    ];
+    for (const extra of cases) {
+        assert.throws(
+            () => registerCapability(extensionId, { id: 'bad', name: 'Bad', ...extra, execute: () => null }),
+            TypeError,
+            JSON.stringify(extra),
+        );
+    }
+});
+
+test('registers data types with stable identities and drops them with the extension', () => {
+    registerExtension({ id: extensionId, name: 'Test Suite' });
+    const type = registerType(extensionId, {
+        id: 'note',
+        name: 'Note',
+        description: 'A short note',
+        schema: { type: 'object', required: ['text'], properties: { text: { type: 'string' } } },
+    });
+    assert.deepEqual(type, {
+        extensionId,
+        id: 'note',
+        name: 'Note',
+        description: 'A short note',
+        schema: { type: 'object', required: ['text'], properties: { text: { type: 'string' } } },
+    });
+    assert.deepEqual(getType(extensionId, 'note'), type);
+    assert.equal(getType(extensionId, 'missing'), null);
+    assert.equal(listTypes(extensionId).length, 1);
+    assert.throws(() => registerType(extensionId, { id: 'note', name: 'Duplicate' }), /already registered/);
+    assert.throws(() => registerType('not-registered', { id: 'x', name: 'X' }), /Register the extension/);
+    assert.equal(getRuntimeInfo().typeCount >= 1, true);
+
+    unregisterExtension(extensionId);
+    assert.equal(listTypes(extensionId).length, 0, 'types are removed with their owner');
+});
 
 test('registers extensions and capabilities and executes a capability', async () => {
     setupExtension();

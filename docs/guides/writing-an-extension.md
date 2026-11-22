@@ -19,6 +19,7 @@ extensions/hello-loom/
     "id": "hello-loom",
     "name": "Hello Loom",
     "version": "0.1.0",
+    "author": "your-name",
     "description": "示例扩展",
     "entry": "index.js",
     "dependencies": [],
@@ -31,10 +32,13 @@ extensions/hello-loom/
 | `id` | 是 | 必须与目录名一致；`/^[a-z0-9][a-z0-9._-]*$/i` |
 | `name` | 是 | 显示名 |
 | `version` | 是 | 字符串，Loom 不做语义化校验 |
+| `author` | 否 | 作者标识；与 `id` 组成身份 `author:id`。缺省视为 `anonymous` |
 | `entry` | 是 | 包内入口 `.js`，必须存在 |
 | `description` | 否 | 面板与索引里显示 |
 | `dependencies` | 否 | 依赖的扩展 id；激活时它们必须已 `active` |
 | `permissions` | 否 | 激活时向用户申请的权限（会弹同意提示） |
+
+`npm run extensions:index` 会对「清单字段 + 入口源码」计算内容哈希并写进索引，Loom 用它识别实际内容；修改入口文件后重新生成索引，哈希会随之变化。
 
 `index.js` 默认导出一个对象或返回该对象的函数：
 
@@ -90,6 +94,32 @@ return result.data;
 
 `caller` 必须是调用方自己的扩展 id；跨扩展调用要显式写目标扩展 id。
 
+能力还可以声明两段可选元数据，便于调用方和工具判断契约：
+
+```js
+globalThis.Loom.registerCapability(id, {
+    id: 'my.tool',
+    name: 'My tool',
+    errors: [{ code: 'NOT_FOUND', description: '目标不存在' }],
+    compatibility: { since: '0.34.0', deprecated: false },
+    execute: () => null,
+});
+```
+
+- `errors`：可能返回的错误码（`UPPER_SNAKE_CASE`），仅作说明，不限制运行时实际错误码；
+- `compatibility`：`since` / `deprecated` / `notes`。
+
+自定义数据类型也可以登记稳定的身份（Loom 不解释内容，只做契约命名）：
+
+```js
+globalThis.Loom.registerType(id, {
+    id: 'note',
+    name: 'Note',
+    schema: { type: 'object', required: ['text'], properties: { text: { type: 'string' } } },
+});
+// getType(id, 'note') / listTypes(id) 按 `扩展id:类型id` 识别
+```
+
 ## 3. 权限
 
 两层：
@@ -141,6 +171,20 @@ const view = globalThis.LoomUI.createView(id, {
 - `tabs` 与 `modal` 是受控组件：交互只上报意图，由你的 `props` 决定显示状态。
 - 事件处理器的参数是 `{ event, payload, path, viewId, extensionId }`；`select`/`input`/`textarea`/`toggle` 的 `change` 把新值放在 `payload` 里（如 `payload.value`）。
 - 没有 `setRoot` 之外的大范围更新手段：状态驱动时重建整棵树最简单；重建会让输入框失焦，所以只在 `change`（失焦后）触发重建。
+
+可复用的组合界面建议注册成**复合组件**，而不是把同一棵树复制到多处：
+
+```js
+globalThis.LoomUI.registerCompositeComponent(id, {
+    id: 'greeting',
+    name: 'Greeting',
+    props: { name: { type: 'string', default: 'world' } },
+    build: props => ({ component: 'text', props: { text: `Hello ${props.name}` } }),
+});
+// 之后任何视图都可以用 { component: 'greeting', props: { name: 'Loom' } }
+```
+
+复合组件与普通组件共享身份、属性校验、事件与清理；它内部是一棵嵌套视图，`update` 时重建、`unmount` 时销毁。
 
 ## 6. 脚本：一个文件就够了
 

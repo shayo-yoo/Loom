@@ -177,6 +177,21 @@ All host capabilities return mapped primitives rather than host objects. When Si
 
 `Loom UI` exposes 17 built-in components: `text`, `button` (`label`), `input`, `textarea` (`value`, `placeholder`, `rows`, `disabled`; emits `change` on blur), `toggle`, `select` (options accept strings or `{ value, label }`), `card`, `row`, `column`, `grid`, `divider`, `list`, `badge`, `image`, `tabs`, `modal`, `menu`. Event handlers receive `{ event, payload, path, viewId, extensionId }`; `select`/`input`/`textarea`/`toggle` put the new value in `payload`. View nodes are `{ component, props?, children?, on?, key? }`; `path` for `setProps`/`setChildren` is an array of child indexes from the root.
 
+Extensions can also register **composite components** — a named view tree reused by identity:
+
+- `LoomUI.registerCompositeComponent(extensionId, { id, name, description?, props?, build(props, context) → node })` registers it through the normal component registry (same identity, prop validation, events, cleanup).
+- The composite mounts its tree as a nested view inside `.loom-composite`; `update` re-renders it and `unmount` destroys it, so no view is leaked when the parent tree changes or the extension unloads.
+- Another extension can use a composite by id. A composite serializes as its own id and props; its internal tree belongs to its definition, not the serialized view.
+
+## Capability metadata
+
+Capability descriptors accept two optional fields beyond the schema and permissions:
+
+- `errors`: `[{ code, description? }]` — declared failure codes (`UPPER_SNAKE_CASE`). Advisory: a handler can still fail with any code.
+- `compatibility`: `{ since?, deprecated?, notes? }` — when the interface appeared and whether it is deprecated.
+
+Both appear in `listCapabilities()`. `registerType(extensionId, { id, name, description?, schema? })` / `getType` / `listTypes` give data types a stable identity (`extensionId:typeId`); the schema is validated but never interpreted.
+
 ## Extension Packages and Installation
 
 A Loom extension package is a directory `extensions/<id>/` with `manifest.json` (`id`/`name`/`version`/`entry`, optional `dependencies`/`permissions`) and the entry module. `npm run extensions:index` writes the deterministic `extensions/index.json` that the browser reads.

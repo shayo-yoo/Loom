@@ -20,6 +20,37 @@ export const INDEX_VERSION = 1;
 const ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/i;
 const PERMISSION_PATTERN = /^[a-z0-9][a-z0-9._:-]*$/i;
 
+/**
+ * FNV-1a 64 over UTF-16 code units — the same algorithm Core's
+ * `computeContentHash` uses, so a hash computed here is accepted by the loader.
+ */
+export function contentHashOf(text) {
+    let hash = 0xcbf29ce484222325n;
+    for (let index = 0; index < text.length; index += 1) {
+        hash ^= BigInt(text.charCodeAt(index));
+        hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+    }
+    return `fnv1a64:${hash.toString(16).padStart(16, '0')}`;
+}
+
+/**
+ * The bytes a package is identified by: its manifest fields plus its entry source.
+ * Key order is explicit so the hash is stable across runs and machines.
+ */
+export function packageContent(manifest, source) {
+    return JSON.stringify({
+        author: manifest.author ?? null,
+        dependencies: manifest.dependencies ?? [],
+        description: manifest.description ?? '',
+        entry: manifest.entry,
+        id: manifest.id,
+        name: manifest.name,
+        permissions: manifest.permissions ?? [],
+        version: manifest.version,
+        source,
+    });
+}
+
 /** Validate one package directory and return its index entry. */
 export function readPackage(extensionsDir, directory) {
     const packageDir = path.join(extensionsDir, directory);
@@ -38,6 +69,9 @@ export function readPackage(extensionsDir, directory) {
     }
     if (manifest.id !== directory) {
         problems.push(`manifest.id "${manifest.id}" must equal its directory name "${directory}"`);
+    }
+    if (manifest.author !== undefined && (typeof manifest.author !== 'string' || !ID_PATTERN.test(manifest.author))) {
+        problems.push('manifest.author must be an identifier when provided');
     }
     if (typeof manifest.name !== 'string' || manifest.name.trim() === '') {
         problems.push('manifest.name must be a non-empty string');
@@ -62,6 +96,8 @@ export function readPackage(extensionsDir, directory) {
     }
 
     if (problems.length > 0) return { id: directory, problems };
+
+    const source = readFileSync(path.join(packageDir, manifest.entry), 'utf8');
     return {
         id: manifest.id,
         problems: [],
@@ -69,11 +105,15 @@ export function readPackage(extensionsDir, directory) {
             id: manifest.id,
             name: manifest.name,
             version: manifest.version,
+            author: manifest.author ?? null,
             description: manifest.description ?? '',
             manifest: `extensions/${directory}/manifest.json`,
             entry: `extensions/${directory}/${manifest.entry}`,
             dependencies: manifest.dependencies ?? [],
             permissions: manifest.permissions ?? [],
+            // Hash of manifest + entry source: identifies the actual package, not a
+            // self-declared content string.
+            contentHash: contentHashOf(packageContent(manifest, source)),
         },
     };
 }
