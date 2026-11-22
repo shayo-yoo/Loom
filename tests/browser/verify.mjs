@@ -2042,6 +2042,16 @@ async function probeMobileLayout(cdp) {
     });
     await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
     try {
+        // A modal from an earlier probe (SillyTavern's own dialog) can leave the
+        // page inert, which makes every element miss elementFromPoint. Close any
+        // dialog before measuring instead of hiding it.
+        await cdp.evaluate(`for (const popup of [...document.querySelectorAll('#dialogs .popup, body > .popup')]) {
+            const button = [...popup.querySelectorAll('button, .popup-button')]
+                .find(candidate => /取消|cancel|关闭|close|确定|ok/i.test(candidate.textContent ?? ''));
+            button?.click();
+        }
+        await new Promise(resolve => setTimeout(resolve, 350));
+        return true;`);
         await cdp.evaluate('await new Promise(resolve => setTimeout(resolve, 400)); return true;');
         const baseline = await cdp.evaluate('return { scrollWidth: document.documentElement.scrollWidth, innerWidth: window.innerWidth };');
         const mobile = await cdp.evaluate(`document.getElementById('loom_extension_button')?.click();
