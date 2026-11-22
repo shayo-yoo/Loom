@@ -2,6 +2,21 @@
   "version": 1,
   "extensions": [
     {
+      "id": "character-panel",
+      "name": "角色面板",
+      "version": "0.1.0",
+      "author": "loom",
+      "description": "示例扩展：把等级/经验/金币/背包渲染成消息内面板，把变化编译成自然语言注入上下文，并接受 AI 回执改动数据。",
+      "manifest": "extensions/character-panel/manifest.json",
+      "entry": "extensions/character-panel/index.js",
+      "dependencies": [],
+      "permissions": [
+        "host.prompt.inject",
+        "host.chat.read"
+      ],
+      "contentHash": "fnv1a64:edef9c7833966b87"
+    },
+    {
       "id": "hello-loom",
       "name": "Hello Loom",
       "version": "0.1.0",

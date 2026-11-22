@@ -153,6 +153,36 @@ test('records where a registration came from', () => {
     assert.throws(() => registerExtension({ id: 'bad-origin', name: 'X', origin: 'plugin' }), /origin must be one of/);
 });
 
+test('a signed numeric range is a valid schema', async () => {
+    // Regression: `minimum`/`maximum` were validated with the length rules, which
+    // rejected `{ minimum: -9999 }` and made any signed-delta capability unregisterable.
+    registerExtension({ id: extensionId, name: 'Test Suite' });
+    const registered = registerCapability(extensionId, {
+        id: 'signed',
+        name: 'Signed delta',
+        input: {
+            type: 'object',
+            required: ['delta'],
+            properties: { delta: { type: 'integer', minimum: -9999, maximum: 9999 } },
+            additionalProperties: false,
+        },
+        execute: input => input,
+    });
+    assert.deepEqual(registered.input.properties.delta, { type: 'integer', minimum: -9999, maximum: 9999 });
+
+    assert.deepEqual(await executeCapability(extensionId, 'signed', { delta: -5 }), { success: true, data: { delta: -5 } });
+    const tooLow = await executeCapability(extensionId, 'signed', { delta: -10000 });
+    assert.equal(tooLow.error.code, 'INVALID_INPUT');
+
+    // Length bounds still require a non-negative integer.
+    assert.throws(() => registerCapability(extensionId, {
+        id: 'bad-length',
+        name: 'Bad length',
+        input: { type: 'string', minLength: -1 },
+        execute: () => 'x',
+    }), /non-negative integer/);
+});
+
 test('registers extensions and capabilities and executes a capability', async () => {
     setupExtension();
 

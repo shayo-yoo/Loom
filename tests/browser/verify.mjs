@@ -2058,6 +2058,105 @@ async function probeBlockRendering(cdp) {
         cleaned.widgets === 0 && cleaned.blocks === 0, JSON.stringify(cleaned));
 }
 
+async function probeCharacterPanel(cdp) {
+    await cdp.waitFor(
+        "return window.Loom?.getExtensionState('character-panel')?.state === 'active' ? true : false;",
+        SETTLE_TIMEOUT_MS, 'character panel active',
+    );
+    // Start from a known state so the probe does not depend on earlier runs.
+    const baseline = await cdp.evaluate(`const Loom = window.Loom;
+        if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) {
+            Loom.registerExtension({ id: 'verify-probe', name: 'Verify Probe' });
+        }
+        // The manifest declares host.prompt.inject, so activation raises a consent
+        // request; approving it here is what a user does in the prompt.
+        if (!Loom.checkPermission('character-panel', 'host.prompt.inject')) {
+            Loom.grantPermission('character-panel', 'host.prompt.inject');
+        }
+        if (!Loom.checkPermission('character-panel', 'host.chat.read')) {
+            Loom.grantPermission('character-panel', 'host.chat.read');
+        }
+        const reset = await Loom.executeCapability('character-panel', 'panel.reset', null, { caller: 'verify-probe' });
+        const state = await Loom.executeCapability('character-panel', 'panel.get', null, { caller: 'verify-probe' });
+        const marker = await Loom.executeCapability('character-panel', 'panel.block', null, { caller: 'verify-probe' });
+        return { reset: reset.success, state: state.data, marker: marker.data };`);
+    assertThat('the demo extension resets to a known state',
+        baseline.reset === true && baseline.state?.level === 1 && baseline.state?.gold === 10,
+        JSON.stringify(baseline.state));
+    assertThat('the extension exposes the marker to embed',
+        typeof baseline.marker === 'string' && baseline.marker.includes('\u27E6loom:character.panel\u27E7'),
+        JSON.stringify(baseline.marker));
+
+    // The panel renders inside a synthetic message, never in the user's chat.
+    const rendered = await cdp.evaluate(`const host = document.createElement('div');
+        host.id = 'loom_panel_probe';
+        host.innerHTML = '<div class="mes" mesid="900"><div class="mes_text">角色 '
+            + '\\u27E6loom:character.panel\\u27E7\\u27E6/loom\\u27E7 结束</div></div>';
+        document.body.append(host);
+        window.LoomUI.refreshBlocks(host);
+        const widget = host.querySelector('.loom-block[data-loom-block="character.panel"]');
+        return { text: widget?.textContent ?? null, hidden: widget?.hidden ?? null };`);
+    assertThat('the panel renders level, gold and an empty bag',
+        rendered.hidden === false && /Lv\.1/.test(rendered.text ?? '') && /金币 10/.test(rendered.text ?? '')
+        && /背包是空的/.test(rendered.text ?? ''),
+        JSON.stringify(rendered));
+
+    // A change must update state, re-render the block and rewrite the injection.
+    const applied = await cdp.evaluate(`const Loom = window.Loom;
+        const result = await Loom.executeCapability('character-panel', 'panel.apply',
+            { op: 'item', name: '药水', delta: 2 }, { caller: 'verify-probe' });
+        const context = window.SillyTavern.getContext();
+        const injected = context.extensionPrompts?.['loom:character-panel:status']?.value ?? null;
+        window.LoomUI.refreshBlocks();
+        const widget = document.querySelector('#loom_panel_probe .loom-block[data-loom-block="character.panel"]');
+        return { result, injected, text: widget?.textContent ?? null };`);
+    assertThat('applying a change updates the state and the panel',
+        applied.result.success === true && applied.result.data?.state?.items?.药水 === 2
+        && /药水 ×2/.test(applied.text ?? ''),
+        JSON.stringify({ data: applied.result.data, text: applied.text }));
+    assertThat('the change is compiled into natural-language prompt text',
+        typeof applied.injected === 'string'
+        && /【角色状态】/.test(applied.injected) && /药水×2/.test(applied.injected)
+        && /【回执规则】/.test(applied.injected) && /\[\[item:物品名:\+1\]\]/.test(applied.injected)
+        && /【最近变化】/.test(applied.injected),
+        JSON.stringify(applied.injected));
+
+    // A receipt from the assistant must apply exactly once.
+    const receipt = await cdp.evaluate(`const Loom = window.Loom;
+        const context = window.SillyTavern.getContext();
+        const chat = context.chat ?? [];
+        chat.push({ name: 'AI', is_user: false, is_system: false, mes: '你捡到了东西 [[item:火把:+1]] [[gold:+5]] [[exp:+150]]' });
+        const index = chat.length - 1;
+        await Loom.emit('host:message:received', { source: 'sillytavern', event: 'MESSAGE_RECEIVED' });
+        await new Promise(resolve => setTimeout(resolve, 300));
+        const afterFirst = await Loom.executeCapability('character-panel', 'panel.get', null, { caller: 'verify-probe' });
+        await Loom.emit('host:message:received', { source: 'sillytavern', event: 'MESSAGE_RECEIVED' });
+        await new Promise(resolve => setTimeout(resolve, 300));
+        const afterSecond = await Loom.executeCapability('character-panel', 'panel.get', null, { caller: 'verify-probe' });
+        chat.pop();
+        return { index, first: afterFirst.data, second: afterSecond.data };`);
+    assertThat('an assistant receipt changes items, gold and experience',
+        receipt.first?.items?.火把 === 1 && receipt.first?.gold === 15
+        && receipt.first?.level === 2 && receipt.first?.exp === 50,
+        JSON.stringify(receipt.first));
+    assertThat('the same receipt is never applied twice',
+        receipt.second?.items?.火把 === 1 && receipt.second?.gold === 15 && receipt.second?.level === 2,
+        JSON.stringify(receipt.second));
+
+    // The receipt is applied but left visible: it is the assistant's own text, and
+    // hiding it would require rewriting the stored message.
+    const finalPrompt = await cdp.evaluate(`const context = window.SillyTavern.getContext();
+        return context.extensionPrompts?.['loom:character-panel:status']?.value ?? null;`);
+    assertThat('the injected prompt reflects the post-receipt state',
+        /Lv\.2/.test(finalPrompt ?? '') && /金币 15/.test(finalPrompt ?? '') && /火把×1/.test(finalPrompt ?? ''),
+        JSON.stringify(finalPrompt));
+
+    const cleaned = await cdp.evaluate(`await window.Loom.executeCapability('character-panel', 'panel.reset', null, { caller: 'verify-probe' });
+        document.getElementById('loom_panel_probe')?.remove();
+        return true;`);
+    assertThat('the panel probe cleans up after itself', cleaned === true);
+}
+
 async function probeWorldRename(cdp) {
     await cdp.evaluate(`const Loom = window.Loom;
         if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) Loom.loadExtension({ id: 'verify-probe', name: 'Verify Probe' });
@@ -2621,6 +2720,7 @@ async function main() {
         await runProbe('prompt injection', probePromptInjection, cdp);
         await runProbe('prompt filter', probePromptFilter, cdp);
         await runProbe('block rendering', probeBlockRendering, cdp);
+        await runProbe('character panel', probeCharacterPanel, cdp);
         await runProbe('native slot', probeNativeSlot, cdp);
         await runProbe('external extensions', probeExternalExtensions, cdp);
         await runProbe('live reads', probeLiveReads, cdp);

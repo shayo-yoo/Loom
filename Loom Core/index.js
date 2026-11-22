@@ -3,7 +3,7 @@ import { createExtensionLoader } from './loader.js';
 const EXTENSION_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/i;
 const PERMISSION_PATTERN = /^[a-z0-9][a-z0-9._:-]*$/i;
 const EVENT_NAME_PATTERN = /^[a-z0-9][a-z0-9:._-]*$/i;
-const LOOM_VERSION = '0.38.0';
+const LOOM_VERSION = '0.39.0';
 const capabilityRegistry = new Map();
 const extensionRegistry = new Map();
 const eventListeners = new Map();
@@ -211,9 +211,17 @@ function checkSchemaDefinition(schema, path = '$') {
     if (schema.additionalProperties && typeof schema.additionalProperties === 'object') {
         errors.push(...checkSchemaDefinition(schema.additionalProperties, `${path}.*`));
     }
-    for (const key of ['minimum', 'maximum', 'minLength', 'maxLength', 'minItems', 'maxItems']) {
-        if (schema[key] !== undefined && (!Number.isFinite(schema[key]) || schema[key] < 0)) {
-            errors.push(`${path}: ${key} must be a non-negative finite number.`);
+    // `minimum`/`maximum` bound a number and may be negative; the length/count
+    // bounds cannot. Grouping them together rejected legitimate schemas such as a
+    // signed delta `{ minimum: -9999 }`.
+    for (const key of ['minimum', 'maximum']) {
+        if (schema[key] !== undefined && !Number.isFinite(schema[key])) {
+            errors.push(`${path}: ${key} must be a finite number.`);
+        }
+    }
+    for (const key of ['minLength', 'maxLength', 'minItems', 'maxItems']) {
+        if (schema[key] !== undefined && (!Number.isInteger(schema[key]) || schema[key] < 0)) {
+            errors.push(`${path}: ${key} must be a non-negative integer.`);
         }
     }
     if (schema.minimum !== undefined && schema.maximum !== undefined && schema.minimum > schema.maximum) {
