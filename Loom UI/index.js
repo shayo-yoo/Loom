@@ -25,6 +25,7 @@ import {
     listBlocks,
     refreshBlocks,
     registerBlock,
+    rerenderBlocks,
 } from './blocks.js';
 import { SLOTS, listSlotMounts, mountToSlot, unmountFromSlot } from './slots.js';
 import {
@@ -850,6 +851,7 @@ function installUiApi() {
         ),
         listBlocks: (extensionId) => listBlocks(extensionId),
         refreshBlocks: (root) => refreshBlocks(root),
+        rerenderBlocks: (extensionId) => rerenderBlocks(extensionId),
         disposeMessageBlocks: (messageId) => disposeMessageBlocks(messageId),
         mountToSlot: (extensionIdOrSlot, slotOrOptions, maybeOptions) => (
             typeof extensionIdOrSlot === 'string' && Object.hasOwn(SLOTS, extensionIdOrSlot)

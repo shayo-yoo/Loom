@@ -1,5 +1,6 @@
 # Change Log
 
+- [CHG-20261123-047](history/recent/CHG-20261123-047.md): Character-panel demo (block UI + natural-language injection + AI receipts), `rerenderBlocks`, a signed-schema fix, and an AI-facing authoring guide (0.39.0).
 - [CHG-20261123-046](history/recent/CHG-20261123-046.md): Interactive block rendering — Loom UI renders blocks in messages (the interaction foundation stays in UI; only authoring tools are extensions) (0.38.0).
 - [CHG-20261123-045](history/recent/CHG-20261123-045.md): Prompt visibility foundation — Loom block syntax plus a prompt filter that keeps blocks out of the model's context, instead of a second regex engine (0.37.0).
 - [CHG-20261123-044](history/recent/CHG-20261123-044.md): External extensions — third-party self-registration with a persisted user confirmation, plus an `origin` on every registration (0.36.0).

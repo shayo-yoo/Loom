@@ -297,7 +297,31 @@ const { id, status } = globalThis.LoomUI.registerExternal({
 - **读完整内容要用 `worlds.export`**：`worlds.entries` 为展示会把内容截断到 2000 字，拿截断内容回写会毁数据。
 - **`worlds.entry.update` 的 `uid` 是字符串**（`worlds.entry.create` 返回的也是字符串），传数字会得到 `INVALID_INPUT`。
 
-## 12. 常见错误
+## 12. 消息内面板与回执：完整示例
+
+`extensions/character-panel/` 是一个可运行的样板，把"界面 + 数据 + 上下文"串成一条闭环，四步对应四个能力：
+
+| 步骤 | 做法 |
+|---|---|
+| 在消息里显示面板 | `LoomUI.registerBlock(id, { id, build })` + 往消息写入 `⟦loom:<kind>⟧⟦/loom⟧` |
+| 保存数据 | `Loom.setState(id, 'panel', {...})`（宿主持久化） |
+| 让 AI 看到状态 | `prompt.set` 注入自然语言，含`【角色状态】`与`【回执规则】` |
+| 让 AI 改状态 | 解析它消息里的 `[[item:药水:+1]]` 之类回执 |
+
+两个容易踩的坑，示例里都处理了：
+
+- **渲染后标记就没有了**：块的标记会被替换成控件容器，所以数据变了要调 `LoomUI.rerenderBlocks(id)`（重建实时视图），而不是再 `refreshBlocks`（那是从文本里找新块）；
+- **回执只处理一次**：激活时把已有消息的下标记为"已处理"，之后只处理新消息，否则刷新/重载会把历史回执重复应用。
+
+回执语法刻意保持朴素（`[[gold:+10]]`、`[[item:药水:-1]]`、`[[exp:+50]]`、`[[level:+1]]`）：模型能照着模仿，短到留在消息里几乎不占 token，而且它本身就是一份可读的操作日志。若希望它完全不出现在上下文里，可以把回执也写成块（`⟦loom:receipt⟧…⟦/loom⟧`），代价是**模型看不到语法就学不会**——这是个取舍，示例选择了"可学习"。
+
+调试这类扩展时：
+
+- 面板里「扩展」区能看到它的状态与错误；
+- 注入是否生效，看 `prompt.list`（只能看到自己的）；
+- 回执没生效时优先检查 `host.chat.read` 授权——没授权就读不到消息，代码里会打印一次警告。
+
+## 13. 常见错误
 
 | 现象 | 原因 |
 |---|---|
@@ -307,3 +331,10 @@ const { id, status } = globalThis.LoomUI.registerExternal({
 | 调用返回 `INVALID_INPUT` | 输入不符合声明的 schema（多余字段也会被拒） |
 | `CAPABILITY_NOT_FOUND` | 目标扩展未激活，或能力 id 写错 |
 | 刷新后手动安装的扩展消失 | 安装记录在 `loom-ui` 状态里；检查宿主 settings 是否持久化 |
+| 数据变了但面板没变 | 渲染后标记已被替换，用 `rerenderBlocks` 而不是 `refreshBlocks` |
+| 回执一直不生效 | 没批 `host.chat.read`（读不到消息），或消息不是新消息（索引已被标记处理） |
+| 双向回执重复应用 | 激活时没有把历史消息标记为已处理 |
+
+## 14. 给 AI 的压缩版
+
+如果要把项目交给 AI 写扩展，直接给它 `docs/guides/ai-extension-authoring.md`：那是同一套规则的机器向摘要（能力表、schema 子集、组件必填 props、块与回执、错误码、自检清单），比本文更短、更适合作为提示词上下文。

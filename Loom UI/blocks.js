@@ -193,7 +193,7 @@ export function renderBlocksIn(body, { messageId, message } = {}) {
                     message: message ?? null,
                 }),
             });
-            records.push({ kind: block.kind, extensionId: entry.extensionId, view, host });
+            records.push({ kind: block.kind, extensionId: entry.extensionId, view, host, inner: block.inner, messageId });
         } catch (error) {
             host.hidden = true;
             host.dataset.loomError = error instanceof Error ? error.message : 'render failed';
@@ -254,6 +254,47 @@ function replaceRangeWithElement(root, from, to, element) {
         parent.removeChild(target.node);
     }
     return inserted;
+}
+
+/**
+ * Rebuild the *views* of blocks that are already mounted.
+ *
+ * `refreshBlocks` needs the marker to still be in the message text, but rendering
+ * replaces it with the widget container — so a state change could never update an
+ * already-rendered panel. This walks the live mounts instead and re-runs each
+ * builder in place, which is what an interactive widget needs after it mutates its
+ * own data.
+ */
+export function rerenderBlocks(extensionId = null) {
+    let count = 0;
+    for (const records of mounts.values()) {
+        for (const record of records) {
+            if (extensionId !== null && record.extensionId !== extensionId) continue;
+            const entry = blockRegistry.get(record.kind);
+            if (!entry) continue;
+            try {
+                record.view?.destroy?.();
+            } catch {
+                // A failed teardown must not stop the rebuild.
+            }
+            try {
+                record.view = createView(entry.extensionId, {
+                    target: record.host,
+                    root: entry.build({
+                        kind: record.kind,
+                        inner: record.inner,
+                        messageId: record.messageId,
+                        message: null,
+                    }),
+                });
+                count += 1;
+            } catch (error) {
+                record.host.hidden = true;
+                record.host.dataset.loomError = error instanceof Error ? error.message : 'render failed';
+            }
+        }
+    }
+    return count;
 }
 
 /**

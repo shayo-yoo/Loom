@@ -36,6 +36,8 @@
 20. Prompt injection is the one family that changes what the model reads, so it has its own permission (`host.prompt.inject`) that no other capability declares, keys are namespaced `loom:<caller>:<key>` so callers cannot collide, writes are read back from the host map before being reported, and every key is an unregister cleanup. Position/role enums are mirrored because `getContext()` exposes the setter but not the enums.
 22. Interactive blocks split along the same line as everything else: **Loom UI renders them** (`blocks.js` — register a kind, refresh a root, text-node-safe replacement, re-render and unregister cleanup), while widget content and any authoring tool are extensions. Putting the renderer behind an extension would make the interaction foundation optional, which contradicts UI's stated responsibility. Blocks are stripped from the prompt by the host adapter, so what is drawn never reaches the model.
 
+23. A rendered block cannot be refreshed by text: rendering replaces its marker with the widget container, so a widget that mutates its own data rebuilds through `rerenderBlocks` (live views) while `refreshBlocks` only discovers markers still present in message text. The character-panel sample depends on that distinction.
+
 21. UI has two mount targets: a self-owned element (the panel, the manager) or a **native slot** from the `slots.js` allowlist. A slot mount wraps a normal view in `.loom-slot`, is lazy when the container does not exist yet, replaces a previous mount for the same (extension, slot), and is an unregister cleanup so an extension cannot leave UI inside a host panel.
 
 ## Verification

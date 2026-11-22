@@ -270,6 +270,7 @@ An extension can put a **display-only region** in message text so a UI can be dr
 - **Rendering lives in Loom UI, not in an extension.** `LoomUI.registerBlock(extensionId, { id, name?, build(context) })` registers a widget kind (business content); the capability to render is part of UI.
 - `LoomUI.refreshBlocks(root?)` renders every block under a root (default `#chat`) into a live view, touching text nodes only. Messages without a block are skipped. `disposeMessageBlocks(messageId)`, `listBlocks(extensionId?)` complete the lifecycle; a kind with no renderer, or a `build` that throws, degrades to a hidden placeholder instead of visible syntax.
 - Re-rendering a message replaces its widget rather than adding another, and unregistering the owner removes its kinds and mounts.
+- `LoomUI.rerenderBlocks(extensionId?)` rebuilds the **live** views in place. Rendering replaces the marker with the widget container, so a widget that changes its own data must call this; `refreshBlocks` only finds markers that are still in the message text.
 
 ## Built-in Host Events (`loom-host`)
 
