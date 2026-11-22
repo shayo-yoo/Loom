@@ -267,7 +267,9 @@ An extension can put a **display-only region** in message text so a UI can be dr
 - `stripBlocks(text, { replacement })` can keep a compact summary instead of removing the block entirely — the extension decides what the model should still see.
 - `prompt.filterStats` (read, ungated) → `{ scanned, stripped }`, for diagnostics without exposing prompt content.
 - **Scope:** Loom only removes its own block syntax. Hiding arbitrary user text stays with SillyTavern's regex extension (the rule is user-written and user-visible), which is why Loom does not ship a second regex engine.
-- Nothing renders blocks yet; rendering is the widget extension's job.
+- **Rendering lives in Loom UI, not in an extension.** `LoomUI.registerBlock(extensionId, { id, name?, build(context) })` registers a widget kind (business content); the capability to render is part of UI.
+- `LoomUI.refreshBlocks(root?)` renders every block under a root (default `#chat`) into a live view, touching text nodes only. Messages without a block are skipped. `disposeMessageBlocks(messageId)`, `listBlocks(extensionId?)` complete the lifecycle; a kind with no renderer, or a `build` that throws, degrades to a hidden placeholder instead of visible syntax.
+- Re-rendering a message replaces its widget rather than adding another, and unregistering the owner removes its kinds and mounts.
 
 ## Built-in Host Events (`loom-host`)
 
