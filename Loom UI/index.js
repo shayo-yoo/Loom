@@ -20,6 +20,7 @@ import {
 } from './views.js';
 import { serializeNode } from './view-tree.js';
 import { registerCompositeComponent } from './composite.js';
+import { SLOTS, listSlotMounts, mountToSlot, unmountFromSlot } from './slots.js';
 import { escapeHtml } from './dom.js';
 import { SETTINGS_ENTRY_ID, buildSettingsEntryHtml, summarizeForSettings } from './settings.js';
 import {
@@ -769,6 +770,16 @@ function installUiApi() {
                 ? registerCompositeComponent(extensionIdOrDefinition, maybeDefinition)
                 : registerCompositeComponent(EXTENSION_ID, extensionIdOrDefinition)
         ),
+        slots: Object.freeze({ ...SLOTS }),
+        mountToSlot: (extensionIdOrSlot, slotOrOptions, maybeOptions) => (
+            typeof extensionIdOrSlot === 'string' && Object.hasOwn(SLOTS, extensionIdOrSlot)
+                ? mountToSlot(EXTENSION_ID, extensionIdOrSlot, slotOrOptions)
+                : mountToSlot(extensionIdOrSlot, slotOrOptions, maybeOptions)
+        ),
+        unmountFromSlot: (extensionIdOrSlot, maybeSlot) => (
+            maybeSlot === undefined ? unmountFromSlot(EXTENSION_ID, extensionIdOrSlot) : unmountFromSlot(extensionIdOrSlot, maybeSlot)
+        ),
+        listSlotMounts: (extensionId) => listSlotMounts(extensionId),
         createView: (extensionIdOrOptions, maybeOptions) => (
             typeof extensionIdOrOptions === 'string'
                 ? createView(extensionIdOrOptions, maybeOptions)

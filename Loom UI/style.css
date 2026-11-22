@@ -24,6 +24,12 @@
     justify-content: center;
 }
 
+/* A view mounted into a native SillyTavern panel slot. */
+.loom-slot {
+    display: block;
+    min-width: 0;
+}
+
 /* Composite components are a named nested view; they stack like a block. */
 .loom-composite {
     display: block;
