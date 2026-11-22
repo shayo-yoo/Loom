@@ -1883,6 +1883,35 @@ async function probeScripts(cdp) {
         scriptBoot?.state === 'active' && restored.success === true && restored.data === 'AGAIN',
         JSON.stringify({ scriptBoot, restored }));
 
+    const savesBeforeDisable = cdp.settingsSaves;
+    const disabled = await cdp.evaluate(`await window.LoomUI.setScriptEnabled(${JSON.stringify(saved.id)}, false);
+        return {
+            listed: window.LoomUI.listScripts().some(script => script.id === ${JSON.stringify(saved.id)}),
+            registered: window.Loom.listExtensions().some(entry => entry.id === ${JSON.stringify(saved.id)}),
+            enabled: (window.Loom.getState('loom-ui', 'scripts') ?? []).find(script => script.id === ${JSON.stringify(saved.id)})?.enabled ?? null,
+        };`);
+    assertThat('a disabled script is unloaded but remembered',
+        disabled.listed === true && disabled.registered === false && disabled.enabled === false,
+        JSON.stringify(disabled));
+
+    assertThat('the disabled flag is flushed to host settings',
+        (await cdp.waitForSettingsSave(savesBeforeDisable, 10_000)) === true);
+    await cdp.send('Page.navigate', { url: ST_URL });
+    await cdp.waitFor("return Boolean(window.Loom && window.LoomUI);", READY_TIMEOUT_MS, 'boot after script disable');
+    await cdp.waitFor("return window.LoomUI?.isReady?.() === true;", SETTLE_TIMEOUT_MS, 'boot after script disable');
+    const stillDisabled = await cdp.evaluate(`return {
+        listed: window.LoomUI.listScripts().some(script => script.id === ${JSON.stringify(saved.id)}),
+        registered: window.Loom.listExtensions().some(entry => entry.id === ${JSON.stringify(saved.id)}),
+    };`);
+    assertThat('a disabled script stays off after a reload',
+        stillDisabled.listed === true && stillDisabled.registered === false, JSON.stringify(stillDisabled));
+
+    const reenabled = await cdp.evaluate(`await window.LoomUI.setScriptEnabled(${JSON.stringify(saved.id)}, true);
+        const call = await window.Loom.executeCapability(${JSON.stringify(saved.id)}, 'verify.echo', { value: 'on' });
+        return { call };`);
+    assertThat('enabling a script runs it again',
+        reenabled.call.success === true && reenabled.call.data === 'ON', JSON.stringify(reenabled));
+
     const removed = await cdp.evaluate(`await window.LoomUI.deleteScript(${JSON.stringify(saved.id)});
         return {
             listed: window.LoomUI.listScripts().some(script => script.id === ${JSON.stringify(saved.id)}),
@@ -1894,22 +1923,29 @@ async function probeScripts(cdp) {
 
 async function probeMobileLayout(cdp) {
     await cdp.send('Emulation.setDeviceMetricsOverride', {
-        width: 390, height: 844, deviceScaleFactor: 2, mobile: true,
+        width: 390, height: 844, deviceScaleFactor: 3, mobile: true,
     });
+    await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
     try {
         await cdp.evaluate('await new Promise(resolve => setTimeout(resolve, 400)); return true;');
         const baseline = await cdp.evaluate('return { scrollWidth: document.documentElement.scrollWidth, innerWidth: window.innerWidth };');
         const mobile = await cdp.evaluate(`document.getElementById('loom_extension_button')?.click();
-            document.getElementById('loom_wbm_button')?.click();
-            await new Promise(resolve => setTimeout(resolve, 500));
+            await new Promise(resolve => setTimeout(resolve, 400));
             const viewport = await window.Loom.executeCapability('loom-host', 'viewport.get', null, { caller: 'loom-ui' });
             const panel = document.getElementById('loom_panel');
-            const manager = document.getElementById('loom_wbm_panel');
             const toggle = document.querySelector('#loom_permissions button');
             const rect = element => element ? element.getBoundingClientRect() : null;
             const panelRect = rect(panel);
-            const managerRect = rect(manager);
             const toggleRect = rect(toggle);
+            // The panel must be hit-testable: a zero-height fixed container (SillyTavern
+            // sets a transformed root on phones) would leave this null or outside.
+            const center = document.elementFromPoint(Math.round(window.innerWidth / 2), Math.round(window.innerHeight / 2));
+            document.getElementById('loom_wbm_button')?.click();
+            await new Promise(resolve => setTimeout(resolve, 500));
+            const manager = document.getElementById('loom_wbm_panel');
+            const managerButton = document.getElementById('loom_wbm_button');
+            const managerRect = rect(manager);
+            const managerButtonRect = rect(managerButton);
             const offenders = [...document.querySelectorAll('#loom_panel *, #loom_wbm_panel *, #loom_consent *')]
                 .filter(node => rect(node) && rect(node).right > window.innerWidth + 1)
                 .slice(0, 3)
@@ -1918,9 +1954,17 @@ async function probeMobileLayout(cdp) {
                 isMobile: viewport.data?.isMobile ?? null,
                 scrollWidth: document.documentElement.scrollWidth,
                 innerWidth: window.innerWidth,
+                innerHeight: window.innerHeight,
                 panelWidth: Math.round(panelRect?.width ?? 0),
+                panelHeight: Math.round(panelRect?.height ?? 0),
+                panelTop: Math.round(panelRect?.top ?? -1),
+                panelInteractive: Boolean(center && panel && panel.contains(center)),
                 managerWidth: Math.round(managerRect?.width ?? 0),
+                managerTop: Math.round(managerRect?.top ?? -1),
+                managerBottom: Math.round(managerRect?.bottom ?? -1),
                 managerLeft: Math.round(managerRect?.left ?? 0),
+                managerButtonTop: Math.round(managerButtonRect?.top ?? -1),
+                managerButtonBottom: Math.round(managerButtonRect?.bottom ?? -1),
                 toggleHeight: Math.round(toggleRect?.height ?? 0),
                 offenders,
             };`);
@@ -1929,11 +1973,18 @@ async function probeMobileLayout(cdp) {
             mobile.scrollWidth <= Math.max(baseline.scrollWidth, mobile.innerWidth)
             && mobile.panelWidth <= mobile.innerWidth && (mobile.offenders ?? []).length === 0,
             JSON.stringify({ mobile, baseline }));
-        assertThat('the manager panel fits the phone viewport',
-            mobile.managerWidth > 0 && mobile.managerWidth <= 390 && mobile.managerLeft >= 0,
+        assertThat('the Loom panel fills the phone viewport and is hit-testable',
+            mobile.panelHeight >= Math.round(mobile.innerHeight * 0.8) && mobile.panelTop === 0
+            && mobile.panelInteractive === true,
+            JSON.stringify(mobile));
+        assertThat('the manager panel and launcher fit the phone viewport',
+            mobile.managerWidth > 0 && mobile.managerWidth <= 390 && mobile.managerLeft >= 0
+            && mobile.managerTop >= 0 && mobile.managerBottom <= mobile.innerHeight
+            && mobile.managerButtonTop >= 0 && mobile.managerButtonBottom <= mobile.innerHeight,
             JSON.stringify(mobile));
         assertThat('tap targets stay usable on a narrow screen', mobile.toggleHeight <= 60, JSON.stringify(mobile));
     } finally {
+        await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: false });
         await cdp.send('Emulation.clearDeviceMetricsOverride');
     }
 }

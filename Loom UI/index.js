@@ -38,6 +38,7 @@ import {
     describeInstalled,
     forgetInstalled,
     normalizeIndex,
+    normalizeScriptRecords,
     normalizeUserSource,
     rememberInstalled,
     scriptIdFor,
@@ -127,10 +128,7 @@ function persistDisabledIds(list) {
 }
 
 function readScripts() {
-    const stored = runtime?.getState?.(EXTENSION_ID, SCRIPTS_STATE_KEY);
-    return Array.isArray(stored)
-        ? stored.filter(script => script && typeof script.id === 'string' && typeof script.source === 'string')
-        : [];
+    return normalizeScriptRecords(runtime?.getState?.(EXTENSION_ID, SCRIPTS_STATE_KEY));
 }
 
 function persistScripts(list) {
@@ -217,7 +215,7 @@ async function bootExtensions() {
         await importSource(source);
     }
     for (const script of scripts) {
-        await runScript(script);
+        if (script.enabled !== false) await runScript(script);
     }
 
     installerReady = true;
@@ -348,7 +346,7 @@ async function runScript(record) {
 async function saveScript(name, source) {
     const trimmed = String(source ?? '').trim();
     if (!trimmed) throw new Error('脚本内容为空。');
-    const record = { id: nextScriptId(name), name: String(name ?? '').trim() || '未命名脚本', source: trimmed };
+    const record = { id: nextScriptId(name), name: String(name ?? '').trim() || '未命名脚本', source: trimmed, enabled: true };
     const result = await runScript(record);
     if (result?.state === 'failed' || result?.error) {
         throw new Error(`脚本运行失败：${result?.error?.message ?? '未知错误'}`);
@@ -357,6 +355,26 @@ async function saveScript(name, source) {
     renderScripts();
     renderInstaller();
     return record.id;
+}
+
+/** Enable or disable a saved script; the source is kept either way. */
+async function setScriptEnabled(id, enabled) {
+    const index = scripts.findIndex(script => script.id === id);
+    if (index < 0) throw new Error(`未找到脚本：${id}`);
+    const next = { ...scripts[index], enabled: Boolean(enabled) };
+    if (next.enabled) {
+        const result = await runScript(next);
+        if (result?.state === 'failed' || result?.error) {
+            throw new Error(`脚本运行失败：${result?.error?.message ?? '未知错误'}`);
+        }
+    } else {
+        runtime?.unloadExtension?.(id);
+    }
+    const list = [...scripts];
+    list[index] = next;
+    persistScripts(list);
+    renderScripts();
+    return Boolean(enabled);
 }
 
 async function updateScript(id, source) {
@@ -395,7 +413,7 @@ function renderScripts() {
         ? '<p class="loom_hint">还没有脚本。写一个小模块即可，不必建扩展目录。</p>'
         : scripts.map(script => {
             const state = runtime?.getExtensionState?.(script.id);
-            const status = state?.state ?? '未运行';
+            const status = script.enabled === false ? '已停用' : (state?.state ?? '未运行');
             const error = state?.error?.message ?? '';
             return `
                 <div class="loom_install_row">
@@ -404,6 +422,7 @@ function renderScripts() {
                         <span class="loom_hint">${escapeHtml(script.id)} · ${escapeHtml(status)}</span>
                         ${error ? `<span class="loom_install_error">${escapeHtml(error)}</span>` : ''}
                     </div>
+                    <button type="button" class="menu_button" data-script-toggle="${escapeHtml(script.id)}" data-enabled="${script.enabled !== false}">${script.enabled === false ? '启用' : '停用'}</button>
                     <button type="button" class="menu_button" data-script-run="${escapeHtml(script.id)}">重新运行</button>
                     <button type="button" class="menu_button" data-script-delete="${escapeHtml(script.id)}">删除</button>
                 </div>`;
@@ -556,6 +575,7 @@ function mountScriptSection() {
 
     section.addEventListener('click', async event => {
         const run = event.target.closest('[data-script-run]');
+        const toggle = event.target.closest('[data-script-toggle]');
         const remove = event.target.closest('[data-script-delete]');
         try {
             if (run) {
@@ -568,6 +588,9 @@ function mountScriptSection() {
                 }
                 renderScripts();
                 renderInstaller();
+            } else if (toggle) {
+                toggle.disabled = true;
+                await setScriptEnabled(toggle.dataset.scriptToggle, toggle.dataset.enabled !== 'true');
             } else if (remove) {
                 remove.disabled = true;
                 await deleteScript(remove.dataset.scriptDelete);
@@ -614,6 +637,7 @@ function installUiApi() {
         setExtensionEnabled: (id, enabled) => setExtensionEnabled(id, enabled),
         reloadExtension: (id) => reloadExtension(id),
         saveScript: (name, source) => saveScript(name, source),
+        setScriptEnabled: (id, enabled) => setScriptEnabled(id, enabled),
         updateScript: (id, source) => updateScript(id, source),
         deleteScript: (id) => deleteScript(id),
         listScripts: () => scripts.map(script => ({ id: script.id, name: script.name, length: script.source.length })),

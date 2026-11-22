@@ -61,7 +61,12 @@ function mountLauncher() {
     button.id = BUTTON_ID;
     button.title = '世界书管理器';
     button.textContent = '世界书';
-    button.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:30000;padding:8px 12px;border-radius:999px;';
+    button.style.cssText = [
+        'position:fixed', 'right:16px', 'z-index:30000', 'padding:8px 12px', 'border-radius:999px',
+        // Anchored from the top: on phones `bottom` resolves against a zero-height
+        // transformed root, which would push the button off screen.
+        'top:calc(100vh - 52px)', 'top:calc(100dvh - 52px)',
+    ].join(';');
     button.addEventListener('click', () => {
         const panel = document.getElementById(PANEL_ID);
         if (!panel) return;
@@ -77,8 +82,9 @@ function renderPanel() {
     const container = document.createElement('div');
     container.id = PANEL_ID;
     container.style.cssText = [
-        // Fits a phone: the panel never exceeds the viewport minus its own margins.
-        'position:fixed', 'right:16px', 'bottom:72px', 'width:min(400px, calc(100vw - 32px))', 'max-height:70vh',
+        // Fits a phone and avoids bottom-anchoring, which a transformed root breaks.
+        'position:fixed', 'right:16px', 'top:64px', 'width:min(400px, calc(100vw - 32px))',
+        'max-height:calc(100vh - 160px)', 'max-height:calc(100dvh - 160px)',
         'overflow:auto', 'z-index:30000', 'padding:12px', 'border-radius:8px',
         'border:1px solid var(--SmartThemeBorderColor, #777)',
         'background:var(--SmartThemeBlurTintColor, #1e1e1e)',

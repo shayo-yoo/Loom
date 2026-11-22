@@ -5,6 +5,7 @@ import {
     describeInstalled,
     forgetInstalled,
     normalizeIndex,
+    normalizeScriptRecords,
     normalizeUserSource,
     rememberInstalled,
     resolveEntryUrl,
@@ -76,6 +77,21 @@ test('forgets an install by id or by entry URL', () => {
     assert.deepEqual(forgetInstalled(installed, 'a').map(entry => entry.id), ['b']);
     assert.deepEqual(forgetInstalled(installed, `${BASE}b/index.js`).map(entry => entry.id), ['a']);
     assert.deepEqual(forgetInstalled(installed, 'missing'), installed, 'unknown targets change nothing');
+});
+
+test('normalises persisted scripts, defaulting old records to enabled', () => {
+    const records = normalizeScriptRecords([
+        { id: 'script-a', name: 'A', source: 'export default {};' },
+        { id: 'script-b', name: 'B', source: 'export default {};', enabled: false },
+        { id: 'broken', name: 'no source' },
+        null,
+        'nonsense',
+    ]);
+    assert.deepEqual(records.map(record => [record.id, record.enabled]), [
+        ['script-a', true],
+        ['script-b', false],
+    ]);
+    assert.deepEqual(normalizeScriptRecords(null), []);
 });
 
 test('generates stable script ids with a collision suffix', () => {

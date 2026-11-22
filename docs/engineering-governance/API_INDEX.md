@@ -193,10 +193,13 @@ A Loom extension package is a directory `extensions/<id>/` with `manifest.json` 
 
 Scripts are the lightweight package form:
 
-- `saveScript(name, source)` → generates an id (`script-<slug>`, collision-suffixed), imports the source through a Blob URL with that identity, and keeps `{ id, name, source }` in `loom-ui` state; saved scripts re-run on boot. Returns the id.
+- `saveScript(name, source)` → generates an id (`script-<slug>`, collision-suffixed), imports the source through a Blob URL with that identity, and keeps `{ id, name, source, enabled }` in `loom-ui` state; enabled scripts re-run on boot. Returns the id.
+- `setScriptEnabled(id, enabled)` → disabling unloads the script and keeps its source; enabling re-runs it. Boot skips disabled scripts, which stay listed as `已停用`.
 - `updateScript(id, source)` / `deleteScript(id)` / `listScripts()` complete the lifecycle.
 - The module default export only needs hooks (`activate`/`deactivate`); identity, permissions and error attribution come from Loom. `saveScript` rejects if the import fails, so a broken script is not stored.
 - There is no sandbox: this is a local loader with the same trust boundary as an extension.
+
+On phones, SillyTavern renders with a transformed, zero-height root; Loom's fixed panel therefore declares `height: 100vh/100dvh` instead of relying on `inset: 0`, and the manager anchors from the top. Fixed overlays in extensions should do the same.
 
 `importExtension(entryUrl, options)` merges `options.manifest` (a package's `manifest.json`) with the module's exported manifest: the explicit manifest wins field by field, but `activate`/`deactivate` come from code when the JSON manifest has none. A package therefore keeps identity in JSON and behaviour in code.
 
