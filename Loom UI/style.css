@@ -24,6 +24,29 @@
     justify-content: center;
 }
 
+/* Collapsible panel sections */
+.loom_section {
+    margin: 8px 0;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 6px;
+    padding: 0 10px 8px;
+}
+
+.loom_section > summary {
+    cursor: pointer;
+    padding: 8px 0;
+    font-weight: 600;
+    list-style-position: inside;
+}
+
+.loom_section > summary:hover {
+    color: var(--SmartThemeQuoteColor, #7aa2f7);
+}
+
+.loom_section_body {
+    padding-top: 2px;
+}
+
 /* Installer / script rows */
 .loom_installer_controls {
     display: flex;
