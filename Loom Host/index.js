@@ -1,7 +1,7 @@
 import '../Loom%20Core/index.js';
 
 const EXTENSION_ID = 'loom-host';
-const HOST_VERSION = '0.35.0';
+const HOST_VERSION = '0.36.0';
 const runtime = globalThis.Loom;
 
 const nullInput = { type: 'null' };
@@ -656,45 +656,77 @@ function toChatMessage(message, index) {
 const chatMessagesCapability = {
     id: 'chat.messages',
     name: '聊天消息',
-    description: '读取当前聊天最近的消息文本（只读，需要 host.chat.read 授权）。',
+    description: '分页读取当前聊天的消息（只读，可按文本搜索，需要 host.chat.read 授权）。',
     permissions: ['host.chat.read'],
     input: {
         type: ['object', 'null'],
         properties: {
-            limit: { type: 'integer', minimum: 1, maximum: 100 },
+            limit: { type: 'integer', minimum: 1, maximum: 200 },
+            // Absolute start index. Counted from the beginning of the chat so a
+            // caller can walk the whole conversation; `total - limit` is the tail.
             offset: { type: 'integer', minimum: 0 },
+            query: { type: 'string', maxLength: 200 },
+            order: { type: 'string', enum: ['oldest', 'newest'] },
         },
         additionalProperties: false,
     },
     output: {
-        type: 'array',
-        items: {
-            type: 'object',
-            required: ['index', 'name', 'isUser', 'isSystem', 'text', 'truncated'],
-            properties: {
-                index: { type: 'integer', minimum: 0 },
-                name: { type: 'string' },
-                isUser: { type: 'boolean' },
-                isSystem: { type: 'boolean' },
-                text: { type: 'string' },
-                truncated: { type: 'boolean' },
+        type: 'object',
+        required: ['total', 'offset', 'limit', 'hasMore', 'messages'],
+        properties: {
+            total: { type: 'integer', minimum: 0 },
+            offset: { type: 'integer', minimum: 0 },
+            limit: { type: 'integer', minimum: 0 },
+            hasMore: { type: 'boolean' },
+            messages: {
+                type: 'array',
+                items: {
+                    type: 'object',
+                    required: ['index', 'name', 'isUser', 'isSystem', 'text', 'truncated'],
+                    properties: {
+                        index: { type: 'integer', minimum: 0 },
+                        name: { type: 'string' },
+                        isUser: { type: 'boolean' },
+                        isSystem: { type: 'boolean' },
+                        text: { type: 'string' },
+                        truncated: { type: 'boolean' },
+                    },
+                    additionalProperties: false,
+                },
             },
-            additionalProperties: false,
         },
+        additionalProperties: false,
     },
     execute: (input) => {
         tryEnsureBridge();
         const options = input ?? {};
-        const limit = Math.min(Math.max(options.limit ?? 20, 1), 100);
+        const limit = Math.min(Math.max(options.limit ?? 20, 1), 200);
         const offset = Math.max(options.offset ?? 0, 0);
         const messages = getHostContext().chat;
-        if (!Array.isArray(messages)) return [];
+        const empty = { total: 0, offset, limit, hasMore: false, messages: [] };
+        if (!Array.isArray(messages)) return empty;
 
-        // offset counts backwards from the newest message; the result is still
-        // returned oldest-first so callers can render it in reading order.
-        const end = Math.max(0, messages.length - offset);
-        const start = Math.max(0, end - limit);
-        return messages.slice(start, end).map((message, position) => toChatMessage(message, start + position));
+        const query = typeof options.query === 'string' ? options.query.trim().toLowerCase() : '';
+        const order = options.order === 'newest' ? 'newest' : 'oldest';
+
+        // Search runs over the visible text, so what a caller can search is exactly
+        // what it could read. `total` is the match count, not the chat length.
+        const indexed = [];
+        messages.forEach((message, index) => {
+            const text = String(message?.mes ?? '');
+            if (query !== '' && !text.toLowerCase().includes(query)) return;
+            indexed.push({ message, index, text });
+        });
+        const ordered = order === 'newest' ? [...indexed].reverse() : indexed;
+        const page = ordered.slice(offset, offset + limit);
+
+        return {
+            total: indexed.length,
+            offset,
+            limit,
+            hasMore: offset + page.length < ordered.length,
+            messages: page.map(entry => toChatMessage(entry.message, entry.index)),
+        };
     },
 };
 

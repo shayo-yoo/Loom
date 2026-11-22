@@ -1,5 +1,7 @@
 # Change Log
 
+- [CHG-20261123-044](history/recent/CHG-20261123-044.md): External extensions — third-party self-registration with a persisted user confirmation, plus an `origin` on every registration (0.36.0).
+- [CHG-20261123-043](history/recent/CHG-20261123-043.md): Chat paging and search — `chat.messages` returns a page object and can walk the whole log (0.36.0).
 - [CHG-20261122-042](history/recent/CHG-20261122-042.md): Native panel slots — `LoomUI.mountToSlot` renders into SillyTavern's own panels with cleanup (0.35.0).
 - [CHG-20261122-041](history/recent/CHG-20261122-041.md): Prompt injection — `prompt.set`/`clear`/`list` behind `host.prompt.inject`, caller-namespaced and removed on unregister (0.35.0).
 - [CHG-20261122-040](history/recent/CHG-20261122-040.md): Composite components — a named view tree registered as a reusable component (0.34.0).

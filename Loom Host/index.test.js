@@ -1650,7 +1650,7 @@ test('chat.append reports an unsupported host', async () => {
     assert.equal(result.error.code, 'HOST_UNSUPPORTED');
 });
 
-test('reads chat messages newest-first slicing without leaking the raw host objects', async () => {
+test('pages chat messages by absolute index without leaking raw host objects', async () => {
     const chat = [
         { name: 'A', is_user: true, mes: 'one', extra: { secret: 'host-internal' } },
         { name: 'System', is_system: true, mes: 'two' },
@@ -1667,20 +1667,55 @@ test('reads chat messages newest-first slicing without leaking the raw host obje
     assert.deepEqual(denied.error.details.missing, ['host.chat.read']);
 
     grantPermission(consumerId, 'host.chat.read');
-    const recent = await executeCapability(EXTENSION_ID, 'chat.messages', { limit: 2 }, { caller: consumerId });
-    assert.equal(recent.success, true);
-    assert.deepEqual(recent.data.map(message => message.text), ['four', 'five']);
-    assert.deepEqual(recent.data.map(message => message.index), [3, 4], 'index is the absolute chat position');
-    assert.deepEqual(recent.data[0], {
-        index: 3, name: 'A', isUser: true, isSystem: false, text: 'four', truncated: false,
+    const first = await executeCapability(EXTENSION_ID, 'chat.messages', { limit: 2 }, { caller: consumerId });
+    assert.equal(first.success, true);
+    assert.deepEqual(first.data.messages.map(message => message.text), ['one', 'two'],
+        'offset counts from the beginning of the chat so the whole log is reachable');
+    assert.deepEqual(first.data.messages.map(message => message.index), [0, 1], 'index is the absolute chat position');
+    assert.deepEqual(first.data, {
+        total: 5, offset: 0, limit: 2, hasMore: true,
+        messages: [
+            { index: 0, name: 'A', isUser: true, isSystem: false, text: 'one', truncated: false },
+            { index: 1, name: 'System', isUser: false, isSystem: true, text: 'two', truncated: false },
+        ],
     });
 
-    const offset = await executeCapability(EXTENSION_ID, 'chat.messages', { limit: 2, offset: 3 }, { caller: consumerId });
-    assert.deepEqual(offset.data.map(message => message.text), ['one', 'two']);
+    const tail = await executeCapability(EXTENSION_ID, 'chat.messages', { limit: 2, offset: 3 }, { caller: consumerId });
+    assert.deepEqual(tail.data.messages.map(message => message.index), [3, 4]);
+    assert.equal(tail.data.hasMore, false);
 
-    // Defaults: newest 20 messages when input is null.
+    const newest = await executeCapability(EXTENSION_ID, 'chat.messages', { limit: 2, order: 'newest' }, { caller: consumerId });
+    assert.deepEqual(newest.data.messages.map(message => message.text), ['five', 'four'],
+        'order: newest walks backwards while keeping absolute indexes');
+    assert.deepEqual(newest.data.messages.map(message => message.index), [4, 3]);
+
     const all = await executeCapability(EXTENSION_ID, 'chat.messages', null, { caller: consumerId });
-    assert.deepEqual(all.data.map(message => message.text), ['one', 'two', 'three', 'four', 'five']);
+    assert.deepEqual(all.data.messages.map(message => message.text), ['one', 'two', 'three', 'four', 'five']);
+    assert.equal(all.data.total, 5);
+    assert.equal(all.data.hasMore, false);
+});
+
+test('searches chat messages and reports the match count', async () => {
+    stubHost({
+        chat: [
+            { name: 'A', is_user: true, mes: 'hello world' },
+            { name: 'B', is_user: false, mes: 'another line' },
+            { name: 'A', is_user: true, mes: 'HELLO again' },
+        ],
+    });
+    registerConsumer();
+    grantPermission(consumerId, 'host.chat.read');
+
+    const matches = await executeCapability(EXTENSION_ID, 'chat.messages', { query: 'hello' }, { caller: consumerId });
+    assert.equal(matches.data.total, 2, 'search is case-insensitive');
+    assert.deepEqual(matches.data.messages.map(message => message.index), [0, 2]);
+
+    const none = await executeCapability(EXTENSION_ID, 'chat.messages', { query: 'absent' }, { caller: consumerId });
+    assert.deepEqual(none.data, { total: 0, offset: 0, limit: 20, hasMore: false, messages: [] });
+
+    const beyond = await executeCapability(EXTENSION_ID, 'chat.messages', { offset: 99 }, { caller: consumerId });
+    assert.deepEqual(beyond.data.messages, [], 'an offset past the end is an empty page');
+    assert.equal(beyond.data.total, 3);
 });
 
 test('truncates long chat messages instead of forwarding unbounded text', async () => {
@@ -1689,8 +1724,8 @@ test('truncates long chat messages instead of forwarding unbounded text', async 
     grantPermission(consumerId, 'host.chat.read');
 
     const result = await executeCapability(EXTENSION_ID, 'chat.messages', {}, { caller: consumerId });
-    assert.equal(result.data[0].text.length, 2000);
-    assert.equal(result.data[0].truncated, true);
+    assert.equal(result.data.messages[0].text.length, 2000);
+    assert.equal(result.data.messages[0].truncated, true);
 });
 
 test('reads world book entries through the host loader', async () => {

@@ -142,6 +142,17 @@ test('registers data types with stable identities and drops them with the extens
     assert.equal(listTypes(extensionId).length, 0, 'types are removed with their owner');
 });
 
+test('records where a registration came from', () => {
+    registerExtension({ id: extensionId, name: 'Managed', origin: 'managed' });
+    assert.equal(listExtensions().find(entry => entry.id === extensionId).origin, 'managed');
+    unregisterExtension(extensionId);
+
+    registerExtension({ id: extensionId, name: 'External', origin: 'external' });
+    assert.equal(listExtensions().find(entry => entry.id === extensionId).origin, 'external');
+
+    assert.throws(() => registerExtension({ id: 'bad-origin', name: 'X', origin: 'plugin' }), /origin must be one of/);
+});
+
 test('registers extensions and capabilities and executes a capability', async () => {
     setupExtension();
 
@@ -154,6 +165,7 @@ test('registers extensions and capabilities and executes a capability', async ()
         declaredId: extensionId,
         identityKey: `anonymous:${extensionId}`,
         contentHash: null,
+        origin: 'direct',
     });
     assert.equal(listCapabilities(extensionId)[0].id, 'echo');
     assert.deepEqual(await executeCapability(extensionId, 'echo', { text: 'hello', priority: 2, tags: ['one'] }), {
