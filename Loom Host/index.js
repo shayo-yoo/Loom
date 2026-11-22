@@ -1,7 +1,8 @@
 import '../Loom%20Core/index.js';
+import { stripBlocks, stripBlocksFromMessage } from '../Loom%20Core/markers.js';
 
 const EXTENSION_ID = 'loom-host';
-const HOST_VERSION = '0.36.0';
+const HOST_VERSION = '0.37.0';
 const runtime = globalThis.Loom;
 
 const nullInput = { type: 'null' };
@@ -21,6 +22,7 @@ const HOST_EVENT_BRIDGE = Object.freeze([
 ]);
 
 let bridge = null;
+let promptFilter = null;
 
 function isRegistered() {
     return Boolean(runtime?.listExtensions?.().some(extension => extension.id === EXTENSION_ID));
@@ -60,11 +62,93 @@ function ensureBridge() {
     });
 }
 
+/**
+ * Prompt filter — keeps Loom blocks out of the generation context.
+ *
+ * A Loom block (`⟦loom:kind⟧…⟦/loom⟧`) is a display-only region: an extension
+ * renders a UI in its place, but the marker and its payload must never reach the
+ * model. SillyTavern offers two public mutation hooks, one per API family, and both
+ * are used here:
+ *
+ * - `CHAT_COMPLETION_PROMPT_READY` → `{ chat: [...] }` for chat-completion APIs;
+ * - `GENERATE_AFTER_COMBINE_PROMPTS` → `{ prompt: string }` for text-completion APIs.
+ *
+ * Only Loom's own block syntax is removed. Hiding arbitrary user text is a
+ * different, more dangerous feature and belongs to SillyTavern's regex extension,
+ * where the user writes and sees the rule.
+ */
+function ensurePromptFilter() {
+    if (promptFilter || !isRegistered()) return;
+    const context = globalThis.SillyTavern?.getContext?.();
+    const eventSource = context?.eventSource;
+    if (typeof eventSource?.on !== 'function' || typeof eventSource?.removeListener !== 'function') return;
+
+    const hostEvents = context.eventTypes ?? {};
+    const attached = new Map();
+    const stats = { stripped: 0, scanned: 0 };
+
+    const stripChat = eventData => {
+        if (!eventData || !Array.isArray(eventData.chat)) return;
+        stats.scanned += 1;
+        let changed = false;
+        const next = eventData.chat.map(message => {
+            const filtered = stripBlocksFromMessage(message);
+            if (filtered !== message) changed = true;
+            return filtered;
+        });
+        if (changed) {
+            stats.stripped += 1;
+            eventData.chat = next;
+        }
+    };
+
+    const stripText = eventData => {
+        if (!eventData || typeof eventData.prompt !== 'string') return;
+        stats.scanned += 1;
+        const filtered = stripBlocks(eventData.prompt);
+        if (filtered !== eventData.prompt) {
+            stats.stripped += 1;
+            eventData.prompt = filtered;
+        }
+    };
+
+    const hooks = [
+        [hostEvents.CHAT_COMPLETION_PROMPT_READY, stripChat],
+        [hostEvents.GENERATE_AFTER_COMBINE_PROMPTS, stripText],
+    ];
+    try {
+        for (const [hostEventName, handler] of hooks) {
+            if (typeof hostEventName !== 'string') continue;
+            eventSource.on(hostEventName, handler);
+            attached.set(hostEventName, handler);
+        }
+    } catch (error) {
+        for (const [hostEventName, handler] of attached) eventSource.removeListener(hostEventName, handler);
+        throw error;
+    }
+
+    promptFilter = { eventSource, attached, stats };
+    runtime.addCleanup(EXTENSION_ID, () => {
+        for (const [hostEventName, handler] of attached) eventSource.removeListener(hostEventName, handler);
+        promptFilter = null;
+    });
+}
+
+/** Counters for diagnostics; reset when the filter is reattached. */
+function getPromptFilterStats() {
+    return { ...(promptFilter?.stats ?? { stripped: 0, scanned: 0 }) };
+}
+
 function tryEnsureBridge() {
     try {
         ensureBridge();
     } catch (error) {
         console.error('[Loom Host] Failed to attach host event bridge:', error);
+    }
+    try {
+        ensurePromptFilter();
+    } catch (error) {
+        console.error('[Loom Host] Failed to attach the prompt filter:', error);
     }
 }
 
@@ -2229,6 +2313,23 @@ const promptListCapability = {
     },
 };
 
+const promptFilterStatsCapability = {
+    id: 'prompt.filterStats',
+    name: 'prompt filter stats',
+    description: 'Counters for the block filter: how many prompt payloads were scanned and how many had blocks removed. Read-only, ungated.',
+    input: nullInput,
+    output: {
+        type: 'object',
+        required: ['scanned', 'stripped'],
+        properties: {
+            scanned: { type: 'integer', minimum: 0 },
+            stripped: { type: 'integer', minimum: 0 },
+        },
+        additionalProperties: false,
+    },
+    execute: () => getPromptFilterStats(),
+};
+
 const CAPABILITIES = Object.freeze([
     snapshotCapability,
     charactersCapability,
@@ -2254,6 +2355,7 @@ const CAPABILITIES = Object.freeze([
     promptSetCapability,
     promptClearCapability,
     promptListCapability,
+    promptFilterStatsCapability,
     settingsGetCapability,
     settingsSetCapability,
     settingsRemoveCapability,

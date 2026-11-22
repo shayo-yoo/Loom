@@ -333,7 +333,9 @@ async function probeLiveReads(cdp) {
 
 async function probePermissionFlow(cdp) {
     // A probe extension stands in for a third-party consumer.
-    await cdp.evaluate("window.Loom.registerExtension({ id: 'verify-probe', name: 'Verify Probe' }); return true;");
+    await cdp.evaluate(`if (!window.Loom.listExtensions().some(entry => entry.id === 'verify-probe')) {
+        window.Loom.registerExtension({ id: 'verify-probe', name: 'Verify Probe' });
+    } return true;`);
 
     // Start from a known state: the run must not depend on what a previous run
     // (or the user) left granted, or the denial checks silently become no-ops.
@@ -1937,6 +1939,58 @@ async function probeExternalExtensions(cdp) {
         cleaned.listed === 0 && cleaned.registered === false, JSON.stringify(cleaned));
 }
 
+async function probePromptFilter(cdp) {
+    // The filter is attached to SillyTavern's own prompt events, so emitting them
+    // with a synthetic payload proves the listener runs and rewrites the payload in
+    // place — the same object the host would send to the model.
+    const result = await cdp.evaluate(`const context = window.SillyTavern.getContext();
+        const events = context.eventTypes;
+        const before = window.Loom.executeCapability
+            ? await window.Loom.executeCapability('loom-host', 'prompt.filterStats', null, { caller: 'loom-ui' })
+            : null;
+        const chatPayload = { chat: [
+            { role: 'system', content: 'plain instructions' },
+            { role: 'assistant', content: 'look at this \\u27E6loom:hud\\u27E7hp=5\\u27E6/loom\\u27E7 done' },
+            { role: 'user', content: 'pointer \\u27E6loom:widget\\u27E7 here' },
+        ], dryRun: false };
+        await context.eventSource.emit(events.CHAT_COMPLETION_PROMPT_READY, chatPayload);
+        const textPayload = { prompt: 'prefix \\u27E6loom:hud\\u27E7{\\"a\\":1}\\u27E6/loom\\u27E7 suffix' };
+        await context.eventSource.emit(events.GENERATE_AFTER_COMBINE_PROMPTS, textPayload);
+        const after = await window.Loom.executeCapability('loom-host', 'prompt.filterStats', null, { caller: 'loom-ui' });
+        return {
+            chat: chatPayload.chat.map(message => message.content),
+            text: textPayload.prompt,
+            before: before?.data ?? null,
+            after: after?.data ?? null,
+        };`);
+    assertThat('the prompt filter strips blocks from a chat-completion prompt',
+        result.chat?.[1] === 'look at this  done' && result.chat?.[2] === 'pointer  here'
+        && result.chat?.[0] === 'plain instructions',
+        JSON.stringify(result.chat));
+    assertThat('the prompt filter strips blocks from a text-completion prompt',
+        result.text === 'prefix  suffix', JSON.stringify(result.text));
+    assertThat('the filter counts what it did',
+        (result.after?.stripped ?? 0) > (result.before?.stripped ?? 0)
+        && (result.after?.scanned ?? 0) >= 2,
+        JSON.stringify({ before: result.before, after: result.after }));
+
+    // A block that an extension writes into a real message must not survive into the
+    // prompt while the stored message keeps it for the UI to render later. The probe
+    // writes to the in-memory chat only and removes the entry afterwards, so no
+    // registration or grant is needed.
+    const roundTrip = await cdp.evaluate(`const context = window.SillyTavern.getContext();
+        const chat = context.chat ?? [];
+        chat.push({ name: 'System', is_system: true, is_user: false, mes: 'hud \\u27E6loom:hud\\u27E7v=1\\u27E6/loom\\u27E7 tail' });
+        const stored = chat[chat.length - 1].mes;
+        const payload = { chat: [{ role: 'assistant', content: stored }] };
+        await context.eventSource.emit(context.eventTypes.CHAT_COMPLETION_PROMPT_READY, payload);
+        chat.pop();
+        return { stored, forwarded: payload.chat[0].content };`);
+    assertThat('a stored block stays in the message but never reaches the prompt',
+        roundTrip.stored.includes('\u27E6loom:hud\u27E7') && roundTrip.forwarded === 'hud  tail',
+        JSON.stringify(roundTrip));
+}
+
 async function probeWorldRename(cdp) {
     await cdp.evaluate(`const Loom = window.Loom;
         if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) Loom.loadExtension({ id: 'verify-probe', name: 'Verify Probe' });
@@ -2498,6 +2552,7 @@ async function main() {
         await runProbe('panel sections', probePanelSections, cdp);
         await runProbe('identity and metadata', probeIdentityAndMetadata, cdp);
         await runProbe('prompt injection', probePromptInjection, cdp);
+        await runProbe('prompt filter', probePromptFilter, cdp);
         await runProbe('native slot', probeNativeSlot, cdp);
         await runProbe('external extensions', probeExternalExtensions, cdp);
         await runProbe('live reads', probeLiveReads, cdp);
