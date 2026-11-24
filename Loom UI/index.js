@@ -236,6 +236,24 @@ async function fetchManifest(url) {
     }
 }
 
+/**
+ * Append the package content hash to an entry URL.
+ *
+ * Browsers cache ES modules per URL, so an edited package kept its old code until the
+ * page cache was cleared (or the hash changed in a way the URL saw). The index already
+ * carries a hash of the package, so using it here is both cheap and correct: editing a
+ * package changes its URL, and reloading picks it up.
+ */
+function cacheBustedEntry(entry, contentHash) {
+    if (typeof entry !== 'string' || !entry) return entry;
+    const hash = typeof contentHash === 'string' && contentHash.trim() !== '' ? contentHash : '';
+    const [base, fragment] = entry.split('#');
+    const url = new URL(base, globalThis.location?.href ?? 'http://localhost/');
+    if (hash) url.searchParams.set('v', hash.replace(/^fnv1a64:/, '').slice(0, 16));
+    else return entry;
+    return `${url.pathname}${url.search}${fragment ? `#${fragment}` : ''}`;
+}
+
 async function importSource(source) {
     const manifest = source.manifest ? await fetchManifest(source.manifest) : null;
     // The generated index owns the package fingerprint (manifest + entry source);
@@ -251,7 +269,7 @@ async function importSource(source) {
     const options = manifestWithHash ? { manifest: manifestWithHash } : {};
     let result;
     try {
-        result = await runtime.importExtension(source.entry, options);
+        result = await runtime.importExtension(cacheBustedEntry(source.entry, source.contentHash), options);
     } catch (error) {
         result = { state: 'failed', error: { message: error instanceof Error ? error.message : String(error) } };
     }
@@ -468,6 +486,10 @@ async function setScriptEnabled(id, enabled) {
     if (index < 0) throw new Error(`未找到脚本：${id}`);
     const next = { ...scripts[index], enabled: Boolean(enabled) };
     if (next.enabled) {
+        // Enabling must work whether the script is unregistered, inactive or failed.
+        // Without the unload a stale registration makes the import fail with
+        // "Extension is already loaded" (same class of bug as re-enabling a package).
+        runtime?.unloadExtension?.(id);
         const result = await runScript(next);
         if (result?.state === 'failed' || result?.error) {
             throw new Error(`脚本运行失败：${result?.error?.message ?? '未知错误'}`);

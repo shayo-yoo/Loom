@@ -12,9 +12,10 @@
       "dependencies": [],
       "permissions": [
         "host.prompt.inject",
-        "host.chat.read"
+        "host.chat.read",
+        "host.chat.write"
       ],
-      "contentHash": "fnv1a64:edef9c7833966b87"
+      "contentHash": "fnv1a64:df753c58a2490eef"
     },
     {
       "id": "hello-loom",

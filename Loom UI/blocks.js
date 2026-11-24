@@ -312,9 +312,12 @@ export function refreshBlocks(root = null) {
         const body = messageElement.querySelector('.mes_text');
         if (!body) continue;
         if (!(body.textContent ?? '').includes('\u27E6loom:')) {
-            // The message no longer holds a block (edited, re-rendered without it):
-            // drop any stale mounts for it.
-            disposeMessageBlocks(messageId);
+            // The marker is absent. That means one of two things: the block is still
+            // there and has already been turned into a widget (rendering replaces the
+            // marker), or the message genuinely lost it. Only dispose in the second
+            // case — disposing a live widget here made a rendered panel vanish on the
+            // next refresh.
+            if (!body.querySelector?.('.loom-block')) disposeMessageBlocks(messageId);
             continue;
         }
         rendered += renderBlocksIn(body, {

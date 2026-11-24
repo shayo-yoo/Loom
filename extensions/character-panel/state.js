@@ -6,6 +6,10 @@
  * without a browser. `index.js` only moves this data in and out of Loom.
  */
 
+// Marker characters come from Core so the panel and the framework cannot disagree
+// about the block grammar.
+import { BLOCK_CLOSE, BLOCK_ID_PATTERN, BLOCK_OPEN } from '../../Loom%20Core/markers.js';
+
 export const DEFAULT_STATE = Object.freeze({
     level: 1,
     exp: 0,
@@ -169,6 +173,21 @@ export function applyReceipts(state, text) {
         else if (result.note) notes.push(result.note);
     }
     return { state: current, notes, rejected };
+}
+
+/** Marker for a block kind; the panel is a pointer block, so no payload is needed. */
+export function panelMarkerFor(kind) {
+    if (typeof kind !== 'string' || !BLOCK_ID_PATTERN.test(kind)) {
+        throw new TypeError('Block kind must be an identifier.');
+    }
+    return `${BLOCK_OPEN}loom:${kind}${BLOCK_CLOSE}${BLOCK_OPEN}/loom${BLOCK_CLOSE}`;
+}
+
+/** Does any message in the chat carry this panel's marker? */
+export function hasPanelMarker(messages, kind) {
+    if (!Array.isArray(messages)) return false;
+    const needle = `${BLOCK_OPEN}loom:${kind}${BLOCK_CLOSE}`;
+    return messages.some(message => String(message?.mes ?? '').includes(needle));
 }
 
 /** One-line-per-entry summary of the panel contents. */

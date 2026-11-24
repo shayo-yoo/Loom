@@ -9,13 +9,18 @@
  *
  * 面板本身只读 + 一个"用掉一个"的按钮；真正的写入都走同一份 `applyCommand`，
  * 所以界面点击和 AI 回执走的是同一条路径，不会出现两套规则。
+ *
+ * 重要：激活或切换聊天时**不写聊天记录**。界面只在用户明确要求时插入
+ * （`panel.show` 能力，或面板里的"插入面板"按钮），否则会悄悄改动每一段对话。
  */
 import {
     applyCommand,
     applyReceipts,
     describeState,
+    hasPanelMarker,
     normalizeState,
     panelLines,
+    panelMarkerFor,
 } from './state.js';
 
 const EXTENSION_ID = 'character-panel';
@@ -29,6 +34,8 @@ let processedMessages = new Set();
 let extensionId = EXTENSION_ID;
 let unsubscribers = [];
 let warnedChatRead = false;
+let panelMessageIndex = null;
+let lastChatSignature = null;
 
 export default {
     activate({ id }) {
@@ -39,6 +46,9 @@ export default {
 
         memo = normalizeState(Loom.getState(id, STATE_KEY));
         processedMessages = new Set(Loom.getState(id, 'processedMessages') ?? []);
+        // A stale index from another chat must not short-circuit the anchor check.
+        panelMessageIndex = null;
+        lastChatSignature = chatSignature();
 
         LoomUI.registerBlock(id, {
             id: BLOCK_KIND,
@@ -48,7 +58,11 @@ export default {
 
         registerCapabilities(Loom, id);
         subscribeToMessages(Loom, id);
+        installLauncher(LoomUI, id);
         void seedBaseline(Loom, id);
+        // Do not write into the conversation on activation: a chat the user did not ask
+        // to change must stay untouched. Only draw a panel that is already there.
+        drawExistingPanel();
         // The prompt is rebuilt from state on every activation so a reload cannot
         // leave the model reading stale numbers.
         void pushPrompt(id, { silent: true });
@@ -134,6 +148,22 @@ function registerCapabilities(Loom, id) {
                     : `\u27E6loom:${BLOCK_KIND}\u27E7\u27E6/loom\u27E7`;
             },
         },
+        {
+            id: 'panel.show',
+            name: 'Show the panel in this chat',
+            description: 'Append the panel to the open conversation (once). Nothing is written until this runs.',
+            output: {
+                type: 'object',
+                required: ['added'],
+                properties: {
+                    added: { type: 'boolean' },
+                    reason: { type: 'string' },
+                    index: { type: 'integer', minimum: 0 },
+                },
+                additionalProperties: false,
+            },
+            execute: () => addPanel(Loom, id),
+        },
     ];
     for (const definition of definitions) {
         try {
@@ -154,13 +184,134 @@ function registerCapabilities(Loom, id) {
  */
 async function seedBaseline(Loom, id) {
     try {
-        for (const message of await readRecent(Loom, id)) {
+        for (const message of await readRecent(Loom, id) ?? []) {
             if (!message.isUser) processedMessages.add(message.index);
         }
         await Loom.setState(id, 'processedMessages', [...processedMessages].slice(-500));
     } catch (error) {
         console.warn('[character-panel] 初始化回执基线失败：', error);
     }
+}
+
+/** The marker an extension embeds to place the panel. */
+function panelMarker() {
+    return panelMarkerFor(BLOCK_KIND);
+}
+
+/**
+ * Put an entry into SillyTavern's wand menu.
+ *
+ * The panel lives in the conversation, but nothing is inserted until the user asks:
+ * a chat entry that appears on its own would be a silent write into their history.
+ * The launcher is therefore the only discoverable way to add it, and it retries
+ * because the wand menu is built after Loom loads.
+ */
+function installLauncher(LoomUI, id) {
+    if (!LoomUI?.mountToSlot) return;
+    const mount = (attempt = 0) => {
+        let view = null;
+        try {
+            view = LoomUI.mountToSlot(id, 'menu', {
+                root: {
+                    component: 'button',
+                    props: { label: '角色面板' },
+                    on: { click: () => void togglePanel(id) },
+                },
+            });
+        } catch (error) {
+            console.warn('[character-panel] 挂载菜单入口失败：', error);
+            return;
+        }
+        if (!view && attempt < 24) setTimeout(() => mount(attempt + 1), 250);
+    };
+    mount();
+}
+
+/** Insert the panel if it is missing, otherwise re-draw the existing one. */
+async function togglePanel(id) {
+    const Loom = globalThis.Loom;
+    if (!Loom) return;
+    if (chatHasPanel()) {
+        drawPanel();
+        return;
+    }
+    const result = await addPanel(Loom, id);
+    if (result.added) return;
+    // A refusal here is almost always a missing grant; ask for it so the user sees
+    // the consent prompt instead of nothing happening.
+    if (result.reason === 'PERMISSION_DENIED' || result.reason === 'CALLER_REQUIRED') {
+        Loom.requestPermission(id, 'host.chat.write', { reason: '角色面板需要在聊天里写入一条面板消息' });
+    } else {
+        console.warn('[character-panel] 无法插入面板：', result.reason);
+    }
+}
+
+/** Draw a panel whose marker is already in the conversation. Never appends. */
+function drawExistingPanel() {
+    if (chatHasPanel()) drawPanel();
+}
+
+/** Is the panel marker present in the open conversation right now? */
+function chatHasPanel() {
+    const chat = globalThis.SillyTavern?.getContext?.()?.chat ?? [];
+    return hasPanelMarker(chat, BLOCK_KIND);
+}
+
+/**
+ * Append one message carrying the panel marker.
+ *
+ * This is an explicit command, deliberately not part of activation: writing into the
+ * user's conversation is a visible side effect, so it happens when the user asks for
+ * it (`LoomUI.createPanel()` from the panel UI, or `panel.show`).
+ */
+async function addPanel(Loom, id) {
+    if (chatHasPanel()) {
+        drawPanel();
+        return { added: false, reason: 'the panel is already in this chat' };
+    }
+    const appended = await Loom.executeCapability('loom-host', 'chat.append', {
+        text: `角色面板\n${panelMarker()}`,
+        type: 'generic',
+    }, { caller: id });
+    if (!appended.success) {
+        console.warn('[character-panel] 无法写入面板消息：', appended.error?.code, appended.error?.message);
+        return { added: false, reason: appended.error?.code ?? 'append failed' };
+    }
+    panelMessageIndex = appended.data.index;
+    // The new message is ours: do not treat it as a receipt to parse.
+    processedMessages.add(panelMessageIndex);
+    await Loom.setState(id, 'processedMessages', [...processedMessages].slice(-500));
+    drawPanel();
+    return { added: true, index: panelMessageIndex };
+}
+
+/**
+ * Draw the panel, retrying briefly.
+ *
+ * SillyTavern renders the message log before Loom is loaded, so a panel message that
+ * already exists has no widget until something asks for one. Rendering is idempotent
+ * (an existing widget keeps its mount), so a few timed attempts settle it.
+ */
+function drawPanel(attempts = 6) {
+    const draw = (remaining) => {
+        try {
+            globalThis.LoomUI?.refreshBlocks?.();
+        } catch (error) {
+            console.warn('[character-panel] 渲染面板失败：', error);
+            return;
+        }
+        if (remaining <= 1) return;
+        if (document.querySelector(`#chat .loom-block[data-loom-block="${BLOCK_KIND}"]`)) return;
+        setTimeout(() => draw(remaining - 1), 250);
+    };
+    draw(attempts);
+}
+
+/** Identify the open conversation: switching chats changes this, appending does not. */
+function chatSignature() {
+    const chat = globalThis.SillyTavern?.getContext?.()?.chat ?? [];
+    const first = chat[0];
+    return `${globalThis.SillyTavern?.getContext?.()?.getCurrentChatId?.() ?? ''}|${first?.name ?? ''}|${String(first?.mes ?? '').slice(0, 40)}`;
 }
 
 /** The tail of the chat, independent of how long the log is. */
@@ -172,7 +323,7 @@ async function readRecent(Loom, id, limit = 200) {
             warnedChatRead = true;
             console.warn('[character-panel] 无法读取聊天，回执将不会被处理：', first.error?.code, first.error?.message);
         }
-        return [];
+        return null;
     }
     const total = first.data?.total ?? 0;
     if (total <= limit) return first.data.messages ?? [];
@@ -191,6 +342,7 @@ function subscribeToMessages(Loom, id) {
     const handle = async () => {
         try {
             const messages = await readRecent(Loom, id);
+            if (messages === null) return;
             const fresh = messages.filter(message => !message.isUser && !processedMessages.has(message.index));
             if (fresh.length === 0) return;
 
@@ -217,9 +369,30 @@ function subscribeToMessages(Loom, id) {
     unsubscribers.push(Loom.subscribe(id, 'host:message:received', handle));
     // A chat switch starts a fresh scope: the stored message indexes belong to the
     // previous chat, so do not carry them over, and re-seed from the new chat.
+    // SillyTavern also emits CHAT_CHANGED on ordinary saves, so reset only when the
+    // conversation really changed.
     unsubscribers.push(Loom.subscribe(id, 'host:chat:changed', () => {
-        processedMessages = new Set();
+        const signature = chatSignature();
+        if (signature !== lastChatSignature) {
+            lastChatSignature = signature;
+            processedMessages = new Set();
+            panelMessageIndex = null;
+            void seedBaseline(Loom, id);
+        }
+        // The new chat may already carry a panel; draw it, but never add one.
+        drawExistingPanel();
+    }));
+    /**
+     * Permissions are granted after activation (the user answers the consent prompt),
+     * so the first read fails. Retry when a grant resolves instead of requiring a
+     * reload — still without writing anything into the chat.
+     */
+    unsubscribers.push(Loom.subscribe(id, 'core:permission:resolved', payload => {
+        if (!payload || payload.extensionId !== id) return;
+        if (payload.status !== 'granted') return;
         void seedBaseline(Loom, id);
+        drawExistingPanel();
+        void pushPrompt(id, { silent: true });
     }));
 }
 

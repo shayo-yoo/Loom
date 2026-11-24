@@ -2068,13 +2068,12 @@ async function probeCharacterPanel(cdp) {
         if (!Loom.listExtensions().some(entry => entry.id === 'verify-probe')) {
             Loom.registerExtension({ id: 'verify-probe', name: 'Verify Probe' });
         }
-        // The manifest declares host.prompt.inject, so activation raises a consent
-        // request; approving it here is what a user does in the prompt.
-        if (!Loom.checkPermission('character-panel', 'host.prompt.inject')) {
-            Loom.grantPermission('character-panel', 'host.prompt.inject');
-        }
-        if (!Loom.checkPermission('character-panel', 'host.chat.read')) {
-            Loom.grantPermission('character-panel', 'host.chat.read');
+        // The manifest declares these, so activation raises consent requests; approving
+        // them here is what the user does in the prompt.
+        for (const permission of ['host.prompt.inject', 'host.chat.read', 'host.chat.write']) {
+            if (!Loom.checkPermission('character-panel', permission)) {
+                Loom.grantPermission('character-panel', permission);
+            }
         }
         const reset = await Loom.executeCapability('character-panel', 'panel.reset', null, { caller: 'verify-probe' });
         const state = await Loom.executeCapability('character-panel', 'panel.get', null, { caller: 'verify-probe' });
@@ -2087,7 +2086,9 @@ async function probeCharacterPanel(cdp) {
         typeof baseline.marker === 'string' && baseline.marker.includes('\u27E6loom:character.panel\u27E7'),
         JSON.stringify(baseline.marker));
 
-    // The panel renders inside a synthetic message, never in the user's chat.
+    // A marker already in a loaded message renders on its own at boot. The harness can
+    // never assert that in the user's chat, so it drives the same code path through a
+    // synthetic message: refreshBlocks walks `.mes[mesid]`, so this is the real renderer.
     const rendered = await cdp.evaluate(`const host = document.createElement('div');
         host.id = 'loom_panel_probe';
         host.innerHTML = '<div class="mes" mesid="900"><div class="mes_text">角色 '
@@ -2095,19 +2096,23 @@ async function probeCharacterPanel(cdp) {
         document.body.append(host);
         window.LoomUI.refreshBlocks(host);
         const widget = host.querySelector('.loom-block[data-loom-block="character.panel"]');
-        return { text: widget?.textContent ?? null, hidden: widget?.hidden ?? null };`);
+        return {
+            text: widget?.textContent ?? null,
+            hidden: widget?.hidden ?? null,
+            markerGone: !host.textContent.includes('\\u27E6loom:'),
+        };`);
     assertThat('the panel renders level, gold and an empty bag',
-        rendered.hidden === false && /Lv\.1/.test(rendered.text ?? '') && /金币 10/.test(rendered.text ?? '')
+        rendered.hidden === false && rendered.markerGone === true
+        && /Lv\.1/.test(rendered.text ?? '') && /金币 10/.test(rendered.text ?? '')
         && /背包是空的/.test(rendered.text ?? ''),
         JSON.stringify(rendered));
 
-    // A change must update state, re-render the block and rewrite the injection.
+    // A change must update state, re-render the mounted widget and rewrite the injection.
     const applied = await cdp.evaluate(`const Loom = window.Loom;
         const result = await Loom.executeCapability('character-panel', 'panel.apply',
             { op: 'item', name: '药水', delta: 2 }, { caller: 'verify-probe' });
         const context = window.SillyTavern.getContext();
         const injected = context.extensionPrompts?.['loom:character-panel:status']?.value ?? null;
-        window.LoomUI.refreshBlocks();
         const widget = document.querySelector('#loom_panel_probe .loom-block[data-loom-block="character.panel"]');
         return { result, injected, text: widget?.textContent ?? null };`);
     assertThat('applying a change updates the state and the panel',
@@ -2121,20 +2126,24 @@ async function probeCharacterPanel(cdp) {
         && /【最近变化】/.test(applied.injected),
         JSON.stringify(applied.injected));
 
-    // A receipt from the assistant must apply exactly once.
+    // A receipt from the assistant must apply exactly once. The message is pushed into
+    // the in-memory conversation and popped again: nothing is written to disk.
     const receipt = await cdp.evaluate(`const Loom = window.Loom;
         const context = window.SillyTavern.getContext();
+        // Restart the receipt scope first: the persisted "already processed" indexes
+        // belong to earlier chats, and a stale index would swallow a fresh receipt.
+        context.eventSource.emit(context.eventTypes.CHAT_CHANGED);
+        await new Promise(resolve => setTimeout(resolve, 500));
         const chat = context.chat ?? [];
         chat.push({ name: 'AI', is_user: false, is_system: false, mes: '你捡到了东西 [[item:火把:+1]] [[gold:+5]] [[exp:+150]]' });
-        const index = chat.length - 1;
         await Loom.emit('host:message:received', { source: 'sillytavern', event: 'MESSAGE_RECEIVED' });
-        await new Promise(resolve => setTimeout(resolve, 300));
+        await new Promise(resolve => setTimeout(resolve, 400));
         const afterFirst = await Loom.executeCapability('character-panel', 'panel.get', null, { caller: 'verify-probe' });
         await Loom.emit('host:message:received', { source: 'sillytavern', event: 'MESSAGE_RECEIVED' });
-        await new Promise(resolve => setTimeout(resolve, 300));
+        await new Promise(resolve => setTimeout(resolve, 400));
         const afterSecond = await Loom.executeCapability('character-panel', 'panel.get', null, { caller: 'verify-probe' });
         chat.pop();
-        return { index, first: afterFirst.data, second: afterSecond.data };`);
+        return { first: afterFirst.data, second: afterSecond.data };`);
     assertThat('an assistant receipt changes items, gold and experience',
         receipt.first?.items?.火把 === 1 && receipt.first?.gold === 15
         && receipt.first?.level === 2 && receipt.first?.exp === 50,
@@ -2143,13 +2152,24 @@ async function probeCharacterPanel(cdp) {
         receipt.second?.items?.火把 === 1 && receipt.second?.gold === 15 && receipt.second?.level === 2,
         JSON.stringify(receipt.second));
 
-    // The receipt is applied but left visible: it is the assistant's own text, and
-    // hiding it would require rewriting the stored message.
     const finalPrompt = await cdp.evaluate(`const context = window.SillyTavern.getContext();
         return context.extensionPrompts?.['loom:character-panel:status']?.value ?? null;`);
     assertThat('the injected prompt reflects the post-receipt state',
         /Lv\.2/.test(finalPrompt ?? '') && /金币 15/.test(finalPrompt ?? '') && /火把×1/.test(finalPrompt ?? ''),
         JSON.stringify(finalPrompt));
+
+    // The append path is deliberately not exercised here: it writes a message into a
+    // chat, and the harness may not create a chat it can safely delete afterwards (the
+    // safety screen blocks selection after a character is removed). `panel.show`'s
+    // decision logic is unit-tested in state.test.js; the send path is verified by hand.
+    const surface = await cdp.evaluate(`const Loom = window.Loom;
+        return {
+            capabilities: Loom.listCapabilities('character-panel').map(entry => entry.id),
+            blockKinds: window.LoomUI.listBlocks('character-panel').map(entry => entry.id),
+        };`);
+    assertThat('the extension exposes the full surface',
+        surface.capabilities?.includes('panel.show') && surface.capabilities?.includes('panel.apply')
+        && surface.blockKinds?.[0] === 'character.panel', JSON.stringify(surface));
 
     const cleaned = await cdp.evaluate(`await window.Loom.executeCapability('character-panel', 'panel.reset', null, { caller: 'verify-probe' });
         document.getElementById('loom_panel_probe')?.remove();
@@ -2720,7 +2740,6 @@ async function main() {
         await runProbe('prompt injection', probePromptInjection, cdp);
         await runProbe('prompt filter', probePromptFilter, cdp);
         await runProbe('block rendering', probeBlockRendering, cdp);
-        await runProbe('character panel', probeCharacterPanel, cdp);
         await runProbe('native slot', probeNativeSlot, cdp);
         await runProbe('external extensions', probeExternalExtensions, cdp);
         await runProbe('live reads', probeLiveReads, cdp);
@@ -2742,6 +2761,9 @@ async function main() {
         await runProbe('character write', probeCharacterWrite, cdp);
         await runProbe('card lifecycle', probeCardLifecycle, cdp);
         await runProbe('chat mutation', probeChatMutation, cdp);
+        // Runs after the chat-writing probes because it leaves SillyTavern on its
+        // safety screen (it deletes the selected scratch character).
+        await runProbe('character panel', probeCharacterPanel, cdp);
         await runProbe('reload restore', probeReloadRestore, cdp);
         await runProbe('extension management', probeExtensionManagement, cdp);
         await runProbe('scripts', probeScripts, cdp);

@@ -2,7 +2,7 @@ import '../Loom%20Core/index.js';
 import { stripBlocks, stripBlocksFromMessage } from '../Loom%20Core/markers.js';
 
 const EXTENSION_ID = 'loom-host';
-const HOST_VERSION = '0.39.0';
+const HOST_VERSION = '0.40.0';
 const runtime = globalThis.Loom;
 
 const nullInput = { type: 'null' };

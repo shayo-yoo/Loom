@@ -6,10 +6,25 @@ import {
     applyCommand,
     applyReceipts,
     describeState,
+    hasPanelMarker,
     normalizeState,
     panelLines,
+    panelMarkerFor,
     parseReceipts,
 } from './state.js';
+
+test('the marker helpers use the framework grammar', () => {
+    const marker = panelMarkerFor('character.panel');
+    assert.equal(marker, '\u27E6loom:character.panel\u27E7\u27E6/loom\u27E7');
+    assert.throws(() => panelMarkerFor('bad kind'), /must be an identifier/);
+
+    assert.equal(hasPanelMarker([{ mes: `hi ${marker}` }], 'character.panel'), true);
+    assert.equal(hasPanelMarker([{ mes: 'no marker' }], 'character.panel'), false);
+    assert.equal(hasPanelMarker([], 'character.panel'), false);
+    assert.equal(hasPanelMarker(null, 'character.panel'), false);
+    // Another kind must not count: the check decides whether to write a new message.
+    assert.equal(hasPanelMarker([{ mes: '\u27E6loom:other\u27E7\u27E6/loom\u27E7' }], 'character.panel'), false);
+});
 
 test('normalizeState coerces junk into a usable state', () => {
     assert.deepEqual(normalizeState(null), { level: 1, exp: 0, expNext: 100, gold: 10, items: {} });
