@@ -374,6 +374,12 @@ async function rescanExtensions() {
     for (const source of allSources()) {
         if (source.id && isDisabled(source.id)) continue;
         if (source.id && runtime?.getExtensionState?.(source.id)?.state === 'active') continue;
+        // A package that is registered but not active is *not* safe to import again:
+        // the loader refuses a second import ("already loaded"). Unload first, which
+        // is the same idempotent path enabling a package uses.
+        if (source.id && runtime?.listExtensions?.().some(entry => entry.id === source.id)) {
+            runtime.unloadExtension?.(source.id);
+        }
         await importSource(source);
     }
     renderInstaller();
