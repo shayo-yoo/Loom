@@ -1951,6 +1951,161 @@ const chatAppendCapability = {
 };
 
 /**
+ * Composer and user-turn writes.
+ *
+ * `chat.append` covers system messages only. These two close the remaining gap for
+ * interactive panels: put text in front of the user without sending it, and speak as
+ * the user (optionally starting a generation).
+ *
+ * - `chat.input.set` touches the textarea only; nothing enters the log, so it is
+ *   gated by `host.chat.write` like the other write paths.
+ * - `chat.send` creates a real user turn and can spend tokens, so it has its own
+ *   permission (`host.chat.send`) and generation is opt-in.
+ */
+const CHAT_INPUT_ELEMENT_ID = 'send_textarea';
+const CHAT_SEND_SCOPE = 'host.chat.send';
+
+const chatInputSetCapability = {
+    id: 'chat.input.set',
+    name: '写入输入框',
+    description: '把文本写进聊天输入框，不发送、不写入记录；需要 host.chat.write 授权。',
+    permissions: ['host.chat.write'],
+    input: {
+        type: 'object',
+        required: ['text'],
+        properties: {
+            text: { type: 'string', maxLength: CHAT_TEXT_LIMIT },
+            mode: { type: 'string', enum: ['replace', 'append'] },
+        },
+        additionalProperties: false,
+    },
+    output: {
+        type: 'object',
+        required: ['text', 'mode', 'length'],
+        properties: {
+            text: { type: 'string' },
+            mode: { type: 'string' },
+            length: { type: 'integer', minimum: 0 },
+        },
+        additionalProperties: false,
+    },
+    execute: (input) => {
+        const mode = input.mode ?? 'replace';
+        const element = globalThis.document?.getElementById?.(CHAT_INPUT_ELEMENT_ID);
+        if (!element || typeof element.value !== 'string') {
+            throw typedError('HOST_UNSUPPORTED', 'The chat input box (#send_textarea) is not available.');
+        }
+        const next = mode === 'append' ? `${element.value}${input.text}` : input.text;
+        element.value = next;
+        // SillyTavern drives its send-button state from the input event; setting the
+        // value alone leaves the button disabled with text in the box.
+        try {
+            element.dispatchEvent?.(new globalThis.Event('input', { bubbles: true }));
+        } catch {
+            // An environment without Event is still able to hold the text.
+        }
+        const applied = typeof element.value === 'string' ? element.value : next;
+        return { text: applied, mode, length: applied.length };
+    },
+};
+
+const chatSendCapability = {
+    id: 'chat.send',
+    name: '以用户身份发言',
+    description: '把文本作为用户消息写入当前聊天，可选触发生成；需要 host.chat.send 授权。只展开宏，不套用宿主的用户输入正则。',
+    permissions: [CHAT_SEND_SCOPE],
+    input: {
+        type: 'object',
+        required: ['text'],
+        properties: {
+            text: { type: 'string', minLength: 1, maxLength: CHAT_TEXT_LIMIT },
+            name: { type: 'string', minLength: 1, maxLength: 64 },
+            generate: { type: 'boolean' },
+            wait: { type: 'boolean' },
+        },
+        additionalProperties: false,
+    },
+    output: {
+        type: 'object',
+        required: ['index', 'name', 'length', 'generationStarted', 'generationCompleted'],
+        properties: {
+            index: { type: 'integer', minimum: 0 },
+            name: { type: 'string' },
+            length: { type: 'integer', minimum: 0 },
+            generationStarted: { type: 'boolean' },
+            generationCompleted: { type: 'boolean' },
+        },
+        additionalProperties: false,
+    },
+    execute: async (input) => {
+        const context = getHostContext();
+        const chat = context.chat;
+        if (!getChatId(context) && (!Array.isArray(chat) || chat.length === 0)) {
+            throw typedError('NO_CHAT', 'No chat is open; open a chat before sending as the user.');
+        }
+        if (!Array.isArray(chat) || typeof context.addOneMessage !== 'function' || typeof context.saveChat !== 'function') {
+            throw typedError('HOST_UNSUPPORTED', 'This SillyTavern version does not expose chat/addOneMessage()/saveChat().');
+        }
+        // Check the generation hook before writing: failing after the message is in
+        // the log would report an error for a send that already happened.
+        if (input.generate === true && typeof context.generate !== 'function') {
+            throw typedError('HOST_UNSUPPORTED', 'This SillyTavern version does not expose generate().');
+        }
+
+        const text = typeof context.substituteParams === 'function'
+            ? context.substituteParams(input.text)
+            : input.text;
+        const name = input.name ?? context.name1 ?? 'User';
+        const message = {
+            name,
+            is_user: true,
+            is_system: false,
+            send_date: new Date().toISOString(),
+            mes: text,
+            extra: {},
+        };
+
+        chat.push(message);
+        try {
+            context.addOneMessage(message, { scroll: true });
+        } catch (error) {
+            // addOneMessage renders from the pushed entry; a failure must not leave a
+            // message the user never typed.
+            const index = chat.indexOf(message);
+            if (index >= 0) chat.splice(index, 1);
+            throw typedError(
+                'HOST_UNSUPPORTED',
+                `The host failed to render the user message: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
+        await context.saveChat();
+
+        const index = chat.indexOf(message);
+        let generationStarted = false;
+        let generationCompleted = false;
+        if (input.generate === true) {
+            generationStarted = true;
+            if (input.wait === true) {
+                // Awaiting means the caller wants the reply before continuing (an
+                // automated loop), so generation errors are its to handle.
+                await context.generate('normal');
+                generationCompleted = true;
+            } else {
+                Promise.resolve()
+                    .then(() => context.generate('normal'))
+                    .catch(error => console.error('[Loom Host] chat.send generation failed:', error));
+            }
+        }
+        return {
+            index: index >= 0 ? index : chat.length - 1,
+            name,
+            length: text.length,
+            generationStarted,
+            generationCompleted,
+        };
+    },
+};
+/**
  * Existing-message mutation.
  *
  * Editing and deleting go through SillyTavern's own functions rather than
@@ -2350,6 +2505,8 @@ const CAPABILITIES = Object.freeze([
     viewportCapability,
     chatMessagesCapability,
     chatAppendCapability,
+    chatInputSetCapability,
+    chatSendCapability,
     chatEditCapability,
     chatDeleteCapability,
     promptSetCapability,

@@ -97,6 +97,8 @@ Write capabilities (the read/write split required by Core requirements §5):
 | `worlds.entry.create` | `{ name, entry? }` | `{ name, uid, created }` | `host.worldinfo.write` |
 | `worlds.entry.remove` | `{ name, uid }` | `{ name, uid, removed }` | `host.worldinfo.write` |
 | `chat.append` | `{ text, type? }` | `{ appended, type, index }` | `host.chat.write` |
+| `chat.input.set` | `{ text, mode? }` | `{ text, mode, length }` | `host.chat.write` |
+| `chat.send` | `{ text, name?, generate?, wait? }` | `{ index, name, length, generationStarted, generationCompleted }` | `host.chat.send` |
 | `prompt.set` | `{ text, position?, depth?, role?, key? }` | `{ key, position, depth, role, length }` | `host.prompt.inject` |
 | `prompt.clear` | `{ key }` or `{ all: true }` | `{ cleared: [key] }` | `host.prompt.inject` |
 | `prompt.list` | — | `[{ key, position, depth, role, length, preview }]` | `host.prompt.inject` |
@@ -131,6 +133,14 @@ Whole-book lifecycle (destructive, hence a separate permission):
 - `sendSystemMessage` renders but does not save, so the handler calls `saveChat?.()` afterwards; a message that is not persisted would silently disappear on the next reload.
 - **Rollback is mandatory.** SillyTavern pushes the message *before* rendering it, so a render failure (or an unsupported type on some builds) can leave a half-written entry. The handler catches the throw, pops everything it added, and reports `HOST_UNSUPPORTED`. A failed append never mutates the chat.
 - Known host hazard (fixed for the default type): when the current chat already contains a malformed entry, SillyTavern's own rendering path can throw `Cannot read properties of undefined (reading 'is_user')`. The handler rolls that back and reports it. The earlier `narrator`/`comment` types failed *unconditionally* on this host version because they have no template; that is why the allowlist now follows the templates. The same `is_user` message can also appear in an environment without a selected persona, which is why the browser harness verifies append/edit/delete on a scratch character's chat rather than the user's.
+
+`chat.input.set` and `chat.send` close the composer gap that `chat.append` leaves open:
+
+- `chat.input.set` writes the **composer** (`#send_textarea`) and nothing else: no message, no save. `mode` is `replace` (default) or `append`. It dispatches an `input` event afterwards because SillyTavern keeps its send-button state there; setting the value alone leaves the button disabled. The returned `text` is read back from the element, not echoed from the request, so a host that rewrites the value is reported honestly. Requires `host.chat.write`; a missing composer is `HOST_UNSUPPORTED`.
+- `chat.send` writes a **user turn**: it pushes the message onto `context.chat`, renders it with `addOneMessage`, and persists with `saveChat`. `{{user}}`-style macros are expanded through `context.substituteParams` when available. It does **not** apply SillyTavern's user-input regexes: `getRegexedString` is not exposed by `getContext()`, so that pipeline is out of reach and the difference is documented rather than hidden.
+- `generate` is opt-in (default `false`) because it spends tokens; `wait` controls whether the call resolves after the generation (`generationCompleted: true`) or returns immediately with `generationStarted: true` and a logged failure if generation breaks. The generation hook is checked **before** the message is written, so a request that cannot be honoured leaves no trace.
+- Own permission `host.chat.send`, separate from `host.chat.write`: an extension that may draft a reply is not automatically allowed to speak as the user.
+- A render failure rolls the pushed message back, for the same reason `chat.append` rolls back: the user must never see a message they did not type.
 
 `chat.edit` changes an existing message's text:
 
