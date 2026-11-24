@@ -215,7 +215,7 @@ A Loom extension package is a directory `extensions/<id>/` with `manifest.json` 
 - `getInstalledExtensions()` → `[{ id, entry, bundled, state, name, version, permissions, dependencies, error }]` for bundled and manually installed packages, with the runtime state (or `missing`) and the declared metadata.
 - `isReady()` → whether boot finished loading the index, packages and scripts.
 - `getInstallProblems()` → the messages collected from failed imports and script runs.
-- `rescanExtensions()` → re-reads `extensions/index.json`, imports new or inactive packages (skipping disabled ones), and returns the known ids. The installer section has a 重新扫描 button for this.
+- `rescanExtensions()` → re-reads `extensions/index.json` and (re)imports every package that is not active, skipping disabled ones; a package that is registered but inactive is unloaded first, because a second import is refused by the loader. Returns the known ids. The installer section has a 重新扫描 button for this.
 
 ## External (self-registering) extensions
 

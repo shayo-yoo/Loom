@@ -1,5 +1,6 @@
 # Change Log
 
+- [CHG-20261124-049](history/recent/CHG-20261124-049.md): Loom loads at order -500 so a stalled third-party extension cannot block it; rescan re-imports inactive packages; the harness waits for SillyTavern init after every reload (0.41.0).
 - [CHG-20261124-048](history/recent/CHG-20261124-048.md): Fixes why the panel never appeared — explicit insertion with a menu entry, no teardown of rendered blocks, cache-busted imports; harness rewritten to avoid chat writes (0.40.0).
 - [CHG-20261123-047](history/recent/CHG-20261123-047.md): Character-panel demo (block UI + natural-language injection + AI receipts), `rerenderBlocks`, a signed-schema fix, and an AI-facing authoring guide (0.39.0).
 - [CHG-20261123-046](history/recent/CHG-20261123-046.md): Interactive block rendering — Loom UI renders blocks in messages (the interaction foundation stays in UI; only authoring tools are extensions) (0.38.0).

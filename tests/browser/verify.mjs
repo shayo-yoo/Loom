@@ -31,6 +31,9 @@ const CHROME_PATH = process.env.LOOM_CHROME || DEFAULT_CHROME;
 const ST_URL = process.env.LOOM_ST_URL || 'http://127.0.0.1:8100/';
 const CDP_PORT = Number(process.env.LOOM_CDP_PORT ?? 0);
 const READY_TIMEOUT_MS = 30_000;
+// SillyTavern's own init can be held up by an unrelated third-party extension doing a
+// network call, so it gets a longer budget than the Loom handshake.
+const INIT_TIMEOUT_MS = 150_000;
 const SETTLE_TIMEOUT_MS = 20_000;
 
 const results = [];
@@ -234,6 +237,22 @@ async function openPageTarget() {
 }
 
 /** Probe the live page. Each probe is one verifiable claim. */
+/**
+ * Wait for SillyTavern's own init to finish.
+ *
+ * Its "Initializing…" overlay makes the page inert: clicks land on the dialog and the
+ * debounced settings save is deferred, so probes that run under it fail for reasons
+ * that have nothing to do with Loom. A slow third-party extension can hold the overlay
+ * for a long time, which is why this gets its own budget.
+ */
+async function waitForHostReady(cdp, label = 'SillyTavern init') {
+    await cdp.waitFor(`const popup = [...document.querySelectorAll('[class*="dialogue_popup"]')]
+        .find(element => getComputedStyle(element).display !== 'none' && element.getBoundingClientRect().height > 0);
+        const loader = document.querySelector('#loader, .loader');
+        const loaderVisible = loader ? getComputedStyle(loader).display !== 'none' && loader.getBoundingClientRect().height > 0 : false;
+        return !popup && !loaderVisible;`, INIT_TIMEOUT_MS, label);
+}
+
 async function probeRuntime(cdp) {
     const info = await cdp.evaluate('return window.Loom ? window.Loom.getRuntimeInfo() : null;');
     if (!assertThat('runtime is installed on the page', info, info ? `version ${info.version}` : 'window.Loom missing')) return;
@@ -1203,6 +1222,12 @@ async function probeChatMutation(cdp) {
             }
             assertThat('the scratch chat card is gone',
                 existsSync(path.join(CHARACTERS_DIR, created.avatar)) === false);
+            // SillyTavern removes the chat file but leaves the character's chat
+            // directory behind; clear it so a run leaves no trace.
+            await rm(path.join('D:\\1\\APP\\SillyTavern', 'data', 'default-user', 'chats', SCRATCH_CHAT_CHAR),
+                { recursive: true, force: true });
+            assertThat('the scratch chat directory is gone',
+                existsSync(path.join('D:\\1\\APP\\SillyTavern', 'data', 'default-user', 'chats', SCRATCH_CHAT_CHAR)) === false);
         }
     }
 }
@@ -1461,6 +1486,7 @@ async function probeExtensionInstall(cdp) {
     assertThat('the install record is flushed to host settings', flushedInstall === true);
     await cdp.send('Page.navigate', { url: ST_URL });
     await cdp.waitFor("return Boolean(document.getElementById('loom_installer'));", READY_TIMEOUT_MS, 'installer after reload');
+    await waitForHostReady(cdp, 'after install reload');
     const restored = await cdp.waitFor(
         `return window.Loom?.getExtensionState('verify-installed')?.state ?? false;`,
         SETTLE_TIMEOUT_MS, 'installed module restored after reload',
@@ -2329,6 +2355,7 @@ async function probeExtensionManagement(cdp) {
     assertThat('the disabled choice is flushed to host settings', savedDisabled === true);
     await cdp.send('Page.navigate', { url: ST_URL });
     await cdp.waitFor("return Boolean(window.Loom && window.LoomUI);", READY_TIMEOUT_MS, 'boot after disable');
+    await waitForHostReady(cdp, 'after disable reload');
     await cdp.waitFor("return window.LoomUI?.isReady?.() === true;", SETTLE_TIMEOUT_MS, 'installer boot after reload');
     const afterReload = await cdp.evaluate(`return {
         registered: window.Loom.listExtensions().some(entry => entry.id === 'hello-loom'),
@@ -2432,6 +2459,7 @@ async function probeScripts(cdp) {
     assertThat('the script source is flushed to host settings', flushedScript === true);
     await cdp.send('Page.navigate', { url: ST_URL });
     await cdp.waitFor("return Boolean(window.Loom && window.LoomUI);", READY_TIMEOUT_MS, 'boot after script save');
+    await waitForHostReady(cdp, 'after script reload');
     // Boot re-runs saved scripts after loading the package index; wait for it.
     const scriptBoot = await (async () => {
         const deadline = Date.now() + SETTLE_TIMEOUT_MS;
@@ -2471,8 +2499,16 @@ async function probeScripts(cdp) {
 
     assertThat('the disabled flag is flushed to host settings',
         (await cdp.waitForSettingsSave(savesBeforeDisable, 10_000)) === true);
+    // A save response can belong to a request that started before the disable, so also
+    // confirm the stored value itself before relying on it across a reload.
+    const storedFlag = await cdp.waitFor(`const stored = window.SillyTavern.getContext().extensionSettings.__loom?.state?.['loom-ui']?.scripts
+        ?? window.Loom.getState('loom-ui', 'scripts') ?? [];
+        return stored.find(script => script.id === ${JSON.stringify(saved.id)})?.enabled === false;`,
+        5_000, 'disabled flag stored');
+    assertThat('the disabled flag is stored before the reload', storedFlag === true);
     await cdp.send('Page.navigate', { url: ST_URL });
     await cdp.waitFor("return Boolean(window.Loom && window.LoomUI);", READY_TIMEOUT_MS, 'boot after script disable');
+    await waitForHostReady(cdp, 'after script disable reload');
     await cdp.waitFor("return window.LoomUI?.isReady?.() === true;", SETTLE_TIMEOUT_MS, 'boot after script disable');
     const stillDisabled = await cdp.evaluate(`return {
         listed: window.LoomUI.listScripts().some(script => script.id === ${JSON.stringify(saved.id)}),
@@ -2624,6 +2660,7 @@ async function probeReloadRestore(cdp) {
 
     await cdp.send('Page.navigate', { url: ST_URL });
     await cdp.waitFor("return Boolean(document.getElementById('loom_extension_button'));", READY_TIMEOUT_MS, 'panel reinstall after reload');
+    await waitForHostReady(cdp, 'after panel reload');
 
     const restored = await cdp.waitFor(`return window.Loom && window.Loom.checkPermission('loom-ui', 'host.settings.write') ? 'restored' : false;`,
         SETTLE_TIMEOUT_MS, 'persisted grant restore');
@@ -2651,6 +2688,11 @@ async function probeReloadRestore(cdp) {
 
 async function cleanup(cdp) {
     try {
+        // Delete scratch books *before* touching grants: removal needs the
+        // host.worldinfo.manage/write grants that the next step revokes.
+        for (const name of [SCRATCH_BOOK, SCRATCH_COPY, RENAME_SRC, RENAME_DST, WBM_BOOK]) {
+            if (await scratchBookExists(cdp, name)) await deleteScratchBook(cdp, name);
+        }
         // Edit the store directly: after a reload the probe extension is no
         // longer registered, so revokePermission() would throw and abort the
         // rest of the cleanup, leaving test grants behind.
@@ -2667,18 +2709,28 @@ async function cleanup(cdp) {
             for (const id of ['verify-probe', 'verify-state', 'verify-imported', 'verify-lifecycle']) {
                 if (window.Loom?.listExtensions().some(entry => entry.id === id)) window.Loom.unregisterExtension(id);
             }
+            // Registered extensions keep their grants in memory and would write them
+            // back on the next save, so revoke through the API first; only the
+            // persisted entries of unregistered probes are deleted with the root.
+            for (const entry of (settings.__loom?.grants ?? [])) {
+                const registered = window.Loom?.listExtensions().some(item => item.id === entry.extensionId);
+                if (!registered) continue;
+                for (const permission of entry.permissions ?? []) {
+                    try { window.Loom.revokePermission(entry.extensionId, permission); } catch { /* already gone */ }
+                }
+            }
             // Clear this extension's own bookkeeping so a rerun starts clean.
             const root = settings.__loom;
             if (root?.state?.['loom-ui']) delete root.state['loom-ui'];
             if (settings.__loom) delete settings.__loom;
             window.SillyTavern.getContext().saveSettingsDebounced();
             return true;`);
-        // A failed probe could leave a scratch book behind.
-        for (const name of [SCRATCH_BOOK, SCRATCH_COPY, RENAME_SRC, RENAME_DST, WBM_BOOK]) {
-            if (await scratchBookExists(cdp, name)) await deleteScratchBook(cdp, name);
-        }
         // Wait for the debounced save to flush before the browser is killed.
         await cdp.evaluate('await new Promise(resolve => setTimeout(resolve, 2000)); return true;');
+        // SillyTavern re-creates the chat directory when it saves the (deleted) scratch
+        // chat, so this has to run after the probes have stopped touching it.
+        await rm(path.join('D:\\1\\APP\\SillyTavern', 'data', 'default-user', 'chats', SCRATCH_CHAT_CHAR),
+            { recursive: true, force: true });
         // Bundled extensions legitimately persist their own state (hello-loom does),
         // so "clean" means no probe namespaces and no grants, not an empty root.
         const remaining = await cdp.evaluate(`const root = window.SillyTavern.getContext().extensionSettings.__loom ?? {};
@@ -2730,6 +2782,7 @@ async function main() {
 
         await cdp.send('Page.navigate', { url: ST_URL });
         await cdp.waitFor("return Boolean(window.Loom && window.Loom.getRuntimeInfo);", READY_TIMEOUT_MS, 'Loom runtime boot');
+        await waitForHostReady(cdp);
 
         await probeRuntime(cdp);
         await runProbe('entries', probeEntries, cdp);
@@ -2784,7 +2837,17 @@ async function main() {
             chrome.kill();
         }
         await sleep(300);
-        await rm(profileDir, { recursive: true, force: true });
+        // Chrome's profile lock can outlive the kill by a moment; a failed unlink here
+        // used to abort the run after the results were already recorded.
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+            try {
+                await rm(profileDir, { recursive: true, force: true });
+                break;
+            } catch (error) {
+                if (attempt === 4) console.warn('could not remove the Chrome profile:', error.message);
+                else await sleep(500);
+            }
+        }
     }
 
     const failed = results.filter(entry => !entry.ok);
