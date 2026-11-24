@@ -115,7 +115,9 @@ test('registers the host adapter and its capabilities', () => {
             'chat.append',
             'chat.delete',
             'chat.edit',
+            'chat.input.set',
             'chat.messages',
+            'chat.send',
             'context.snapshot',
             'prompt.clear',
             'prompt.filterStats',
@@ -1527,6 +1529,164 @@ test('chat.append refuses to write without an open chat', async () => {
 
     const result = await executeCapability(EXTENSION_ID, 'chat.append', { text: 'x' }, { caller: consumerId });
     assert.equal(result.error.code, 'NO_CHAT');
+});
+
+/**
+ * A chat host with the members `chat.send` needs: rendering, saving, generation and
+ * macro substitution. `chat.append`'s stub covers system messages only, so the user
+ * path gets its own.
+ */
+function stubUserChatHost(options = {}) {
+    const chat = options.chat ?? [];
+    const calls = [];
+    let saved = 0;
+    stubHost({
+        chatId: 'chat-1',
+        chat,
+        name1: 'Player',
+        substituteParams: text => text.replaceAll('{{user}}', 'Player'),
+        addOneMessage: (message, renderOptions) => {
+            calls.push(['addOneMessage', message, renderOptions]);
+            if (options.failRender) throw new Error('render failed');
+        },
+        saveChat: async () => {
+            saved += 1;
+            calls.push(['saveChat']);
+        },
+        generate: async type => {
+            calls.push(['generate', type]);
+            if (options.failGenerate) throw new Error('generation failed');
+        },
+    });
+    return { chat, calls, saved: () => saved };
+}
+
+/** Minimal textarea for `chat.input.set`: records value and dispatched events. */
+function stubInputBox(initial = '') {
+    const events = [];
+    const element = {
+        value: initial,
+        dispatchEvent: event => {
+            events.push(event?.type ?? 'unknown');
+            return true;
+        },
+    };
+    globalThis.document = { getElementById: id => (id === 'send_textarea' ? element : null) };
+    return {
+        element,
+        events,
+        restore: () => {
+            delete globalThis.document;
+        },
+    };
+}
+
+test('chat.input.set writes the composer and reports what it holds', async () => {
+    const box = stubInputBox('old text');
+    try {
+        registerConsumer();
+        grantPermission(consumerId, 'host.chat.write');
+
+        const replaced = await executeCapability(EXTENSION_ID, 'chat.input.set', { text: '新的输入' }, { caller: consumerId });
+        assert.deepEqual(replaced, { success: true, data: { text: '新的输入', mode: 'replace', length: 4 } });
+        assert.equal(box.element.value, '新的输入');
+        assert.deepEqual(box.events, ['input'], 'the input event keeps the send button in step');
+
+        const appended = await executeCapability(EXTENSION_ID, 'chat.input.set',
+            { text: '，继续', mode: 'append' }, { caller: consumerId });
+        assert.equal(appended.data.text, '新的输入，继续');
+        assert.equal(appended.data.mode, 'append');
+    } finally {
+        box.restore();
+    }
+});
+
+test('chat.input.set is gated and refuses a missing input box', async () => {
+    const box = stubInputBox('');
+    try {
+        registerConsumer();
+        const denied = await executeCapability(EXTENSION_ID, 'chat.input.set', { text: 'x' }, { caller: consumerId });
+        assert.equal(denied.error.code, 'PERMISSION_DENIED');
+        assert.deepEqual(denied.error.details.missing, ['host.chat.write']);
+
+        grantPermission(consumerId, 'host.chat.write');
+        delete globalThis.document;
+        const missing = await executeCapability(EXTENSION_ID, 'chat.input.set', { text: 'x' }, { caller: consumerId });
+        assert.equal(missing.error.code, 'HOST_UNSUPPORTED');
+    } finally {
+        box.restore();
+    }
+});
+
+test('chat.send writes a user turn, renders and saves it', async () => {
+    const host = stubUserChatHost({ chat: [{ name: 'A', mes: 'hi', is_user: false }] });
+    registerConsumer();
+    grantPermission(consumerId, 'host.chat.send');
+
+    const result = await executeCapability(EXTENSION_ID, 'chat.send', { text: '我选择 {{user}} 的选项' }, { caller: consumerId });
+    assert.deepEqual(result, {
+        success: true,
+        data: { index: 1, name: 'Player', length: 14, generationStarted: false, generationCompleted: false },
+    });
+    assert.equal(host.chat.length, 2);
+    const message = host.chat[1];
+    assert.equal(message.is_user, true);
+    assert.equal(message.is_system, false);
+    assert.equal(message.mes, '我选择 Player 的选项', 'macros are expanded');
+    assert.match(message.send_date, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(host.saved(), 1);
+    assert.deepEqual(host.calls.filter(call => call[0] === 'generate'), [], 'generation is opt-in');
+});
+
+test('chat.send starts generation without waiting, or waits when asked', async () => {
+    const host = stubUserChatHost({ chat: [] });
+    registerConsumer();
+    grantPermission(consumerId, 'host.chat.send');
+
+    const fireAndForget = await executeCapability(EXTENSION_ID, 'chat.send',
+        { text: 'go', generate: true }, { caller: consumerId });
+    assert.equal(fireAndForget.data.generationStarted, true);
+    assert.equal(fireAndForget.data.generationCompleted, false, 'an un-awaited generation cannot be reported as complete');
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.deepEqual(host.calls.filter(call => call[0] === 'generate'), [['generate', 'normal']]);
+
+    const waited = await executeCapability(EXTENSION_ID, 'chat.send',
+        { text: 'again', generate: true, wait: true }, { caller: consumerId });
+    assert.equal(waited.data.generationStarted, true);
+    assert.equal(waited.data.generationCompleted, true);
+});
+
+test('chat.send rolls the message back when the host cannot render it', async () => {
+    const host = stubUserChatHost({ chat: [{ name: 'A', mes: 'hi' }], failRender: true });
+    registerConsumer();
+    grantPermission(consumerId, 'host.chat.send');
+
+    const result = await executeCapability(EXTENSION_ID, 'chat.send', { text: 'draft' }, { caller: consumerId });
+    assert.equal(result.error.code, 'HOST_UNSUPPORTED');
+    assert.equal(host.chat.length, 1, 'a message the user never typed must not survive');
+    assert.equal(host.saved(), 0);
+});
+
+test('chat.send is gated, needs an open chat, and checks generate before writing', async () => {
+    const host = stubUserChatHost({ chat: [{ name: 'A', mes: 'hi' }] });
+    registerConsumer();
+
+    const denied = await executeCapability(EXTENSION_ID, 'chat.send', { text: 'x' }, { caller: consumerId });
+    assert.equal(denied.error.code, 'PERMISSION_DENIED');
+    assert.deepEqual(denied.error.details.missing, ['host.chat.send']);
+    assert.equal(host.chat.length, 1);
+
+    grantPermission(consumerId, 'host.chat.send');
+    stubChatHost({ chat: [], chatId: null });
+    const noChat = await executeCapability(EXTENSION_ID, 'chat.send', { text: 'x' }, { caller: consumerId });
+    assert.equal(noChat.error.code, 'NO_CHAT');
+
+    // No generate hook: the write must be refused up front, not after the message lands.
+    stubHost({ chatId: 'chat-1', chat: [{ name: 'A', mes: 'hi' }], addOneMessage: () => {}, saveChat: async () => {} });
+    const noGenerate = await executeCapability(EXTENSION_ID, 'chat.send',
+        { text: 'x', generate: true }, { caller: consumerId });
+    assert.equal(noGenerate.error.code, 'HOST_UNSUPPORTED');
+    assert.equal(globalThis.SillyTavern.getContext().chat.length, 1, 'nothing is written when the request cannot be honoured');
 });
 
 test('chat.edit rewrites a message and reports the previous text', async () => {

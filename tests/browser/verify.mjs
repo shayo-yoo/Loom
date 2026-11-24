@@ -1207,6 +1207,63 @@ async function probeChatMutation(cdp) {
         const deletedOnDisk = chatFile !== null && await waitForFile(chatFile, text => !text.includes('edited greeting'), 5_000);
         assertThat('the deleted message is gone from the chat file', deletedOnDisk,
             `file=${chatFile ?? 'not found'}`);
+
+        // chat.send writes a real user turn; it stays inside this scratch chat. Generation is
+        // deliberately NOT exercised here: it would reach a real model API (cost, credentials)
+        // and the harness cannot stub it, because getContext() hands out a fresh object each
+        // call. The generate/wait wiring is covered by unit tests with a stubbed host.
+        if (!await cdp.evaluate(`return window.Loom.checkPermission('verify-probe', 'host.chat.send');`)) {
+            await cdp.evaluate("window.Loom.grantPermission('verify-probe', 'host.chat.send'); return true;");
+        }
+        const sent = await cdp.evaluate(`const Loom = window.Loom;
+            const context = window.SillyTavern.getContext();
+            const before = context.chat.length;
+            const plain = await Loom.executeCapability('loom-host', 'chat.send',
+                { text: '我选择 {{user}} 的选项' }, { caller: 'verify-probe' });
+            await new Promise(resolve => setTimeout(resolve, 300));
+            const entry = context.chat[context.chat.length - 1];
+            return {
+                plain: plain.data,
+                isUser: entry?.is_user === true,
+                entryText: entry?.mes ?? null,
+                userName: context.name1,
+                messagesAdded: context.chat.length - before,
+                rendered: document.querySelectorAll('#chat .mes').length,
+            };`);
+        assertThat('chat.send appends a user turn with macros expanded',
+            sent.plain?.index >= 0 && sent.isUser === true
+            && sent.entryText === `我选择 ${sent.userName} 的选项`
+            && sent.plain?.generationStarted === false && sent.messagesAdded === 1,
+            JSON.stringify(sent));
+        const sentOnDisk = chatFile !== null && await waitForFile(chatFile, text => text.includes('我选择'), 5_000);
+        assertThat('the sent message is persisted to the scratch chat file', sentOnDisk,
+            `file=${chatFile ?? 'not found'}`);
+
+        // The composer is not chat data: set, append, then restore what was there.
+        const composer = await cdp.evaluate(`const Loom = window.Loom;
+            const box = document.getElementById('send_textarea');
+            const original = box?.value ?? null;
+            try {
+                if (!box) return { available: false };
+                const replaced = await Loom.executeCapability('loom-host', 'chat.input.set',
+                    { text: '快捷回复草稿' }, { caller: 'verify-probe' });
+                const appended = await Loom.executeCapability('loom-host', 'chat.input.set',
+                    { text: '，续写', mode: 'append' }, { caller: 'verify-probe' });
+                return {
+                    available: true,
+                    replaced: replaced.data,
+                    appended: appended.data,
+                    value: box.value,
+                };
+            } finally {
+                if (box && original !== null) box.value = original;
+            }`);
+        assertThat('chat.input.set fills the composer without sending',
+            composer.available === true
+            && composer.replaced?.text === '快捷回复草稿'
+            && composer.appended?.text === '快捷回复草稿，续写'
+            && composer.value === '快捷回复草稿，续写',
+            JSON.stringify(composer));
     } finally {
         if (created?.ok === true) {
             try {
